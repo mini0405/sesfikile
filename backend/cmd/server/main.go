@@ -12,6 +12,7 @@ import (
 
 	"sesfikile/backend/internal/config"
 	"sesfikile/backend/internal/db"
+	"sesfikile/backend/internal/identity"
 	"sesfikile/backend/internal/server"
 )
 
@@ -20,6 +21,12 @@ func main() {
 
 	cfg := config.Load()
 
+	if err := db.Migrate(cfg.DatabaseURL); err != nil {
+		logger.Warn("skipping migrations: database not reachable or migration failed", "error", err)
+	} else {
+		logger.Info("migrations applied")
+	}
+
 	database, err := db.New(cfg.DatabaseURL)
 	if err != nil {
 		logger.Error("failed to initialize db pool", "error", err)
@@ -27,7 +34,11 @@ func main() {
 	}
 	defer database.Close()
 
-	router := server.NewRouter(database)
+	tokens := identity.NewTokenIssuer(cfg.JWTSecret)
+	identityRepo := identity.NewRepo(database.Pool)
+	identityHandlers := identity.NewHandlers(identityRepo, tokens)
+
+	router := server.NewRouter(database, identityHandlers, tokens)
 
 	httpServer := &http.Server{
 		Addr:    ":" + cfg.Port,

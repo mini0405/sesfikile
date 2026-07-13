@@ -1,5 +1,8 @@
 # Ses'fikile — project context for Claude Code
 
+> Read `docs/PROGRESS.md` first to see what's already built. Append a new dated entry to it
+> at the end of every stage.
+
 ## What this is
 Ses'fikile is a closed-loop digital transit ecosystem for South African minibus
 taxis: cashless fares, live tracking, automated fuel disbursement. This repo is

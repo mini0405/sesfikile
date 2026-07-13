@@ -7,6 +7,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/go-chi/chi/v5"
+
+	"sesfikile/backend/internal/identity"
 )
 
 type fakePinger struct {
@@ -17,8 +21,14 @@ func (f fakePinger) Ping(ctx context.Context) error {
 	return f.err
 }
 
+func testRouter(pinger Pinger) chi.Router {
+	tokens := identity.NewTokenIssuer("test-secret")
+	handlers := identity.NewHandlers(identity.NewRepo(nil), tokens)
+	return NewRouter(pinger, handlers, tokens)
+}
+
 func TestHealthHandler_Healthy(t *testing.T) {
-	r := NewRouter(fakePinger{err: nil})
+	r := testRouter(fakePinger{err: nil})
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	w := httptest.NewRecorder()
@@ -38,7 +48,7 @@ func TestHealthHandler_Healthy(t *testing.T) {
 }
 
 func TestHealthHandler_Degraded(t *testing.T) {
-	r := NewRouter(fakePinger{err: errors.New("connection refused")})
+	r := testRouter(fakePinger{err: errors.New("connection refused")})
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	w := httptest.NewRecorder()
