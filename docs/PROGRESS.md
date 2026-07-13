@@ -373,3 +373,161 @@ it's a good demonstration of why this fix avoids ad-hoc/partial ledger deletions
 cleanup code.
 
 Next: Stage 4 — telemetry
+
+---
+
+## Stage 4 — telemetry — DONE (2026-07-13)
+
+Built:
+- `backend/internal/telemetry/` — the telemetry module:
+  - `store.go` — `VehicleStateStore`, a concurrency-safe in-memory
+    `map[uuid.UUID]VehicleState` guarded by a single `sync.RWMutex`. Holds,
+    per vehicle: `RouteID`, `DriverID`, `Lat`/`Lng`, `SeatsTotal`,
+    `SeatsAvailable`, `Online`, `LastUpdated`. **In memory only, not
+    Postgres** — positions reset on server restart (accepted MVP trade-off,
+    avoids introducing Redis this stage) and no GPS history/track is
+    persisted (that's Analytics' job later, per the stage brief). "Offline"
+    is modeled as **absent from the map** rather than an `online=false` row,
+    so a disconnected vehicle is automatically excluded from route
+    snapshots with no separate cleanup pass. `GoOnline`/`GoOffline`/
+    `UpdatePosition`/`AdjustSeats`/`SetSeatsAbsolute`/`Get`/`ListByRoute` all
+    copy values in and out — callers never share mutable state with the
+    store. Seat writes (`AdjustSeats`, `SetSeatsAbsolute`) always clamp to
+    `[0, seats_total]`.
+  - `hub.go` — `Hub`, a per-route pub/sub fan-out. `Subscribe(routeID)`
+    hands back a `*Subscriber` with a buffered channel (32); `Publish`
+    iterates that route's subscribers under an `RWMutex.RLock` and does a
+    **non-blocking** `select`-with-`default` send to each — a slow/stuck
+    commuter has updates dropped for it rather than blocking the publisher,
+    which is always the driver ingestion path. This is the concurrency
+    property the stage is actually testing: driver writes never wait on
+    commuter reads.
+  - `view.go` — `VehicleView`, the JSON-serializable projection of
+    `VehicleState` sent over REST/WS (ids as strings, timestamp as RFC3339).
+  - `handlers.go` — REST + WS endpoints (see below), plus `bearerToken`
+    (Authorization header, falling back to a `token` query param — needed
+    because browsers' WebSocket API can't set custom handshake headers, so
+    a real commuter/driver web client has no choice but the query param;
+    `cmd/wsdriver` demonstrates the header form since a Go client can use
+    either).
+- **WebSocket library: `github.com/gorilla/websocket`**, not `coder/websocket`
+  — it's the library CLAUDE.md's stack already anticipated, is
+  battle-tested, and its explicit `Upgrader`/`Conn.WriteJSON`/`ReadJSON` API
+  maps directly onto the hub/fan-out pattern used here (one goroutine per
+  connection doing explicit non-blocking-via-hub writes, no implicit
+  background goroutines to reason about).
+- Endpoints wired into `internal/server/router.go`:
+  - `GET /ws/driver?route_id=<id>[&token=<jwt>]` — **not** behind
+    `identity.RequireAuth` middleware, since the JWT must be validated
+    *before* the HTTP→WS upgrade completes and middleware can't see inside
+    that; `DriverWS` parses/validates the token itself via `bearerToken` +
+    `tokens.Parse`. Requires role `driver`, an explicit `route_id` (going
+    online only makes sense "online on a route" — no separate two-step
+    "go online" call), a `drivers` row for the caller, and an **active**
+    `vehicle_assignments` row for that driver (reusing Stage 1 data, not
+    trusting a client-supplied vehicle id). On successful upgrade: marks
+    the assigned vehicle online in the store (`seats_total` = the vehicle's
+    Stage 1 `capacity`) and publishes an `update` event; on any
+    disconnect (clean or not, via `defer`): marks it offline and publishes
+    an `offline` event. Read loop accepts `{lat,lng}` position updates,
+    `{seats_available}` (absolute) or `{seats_delta}` (relative) seat
+    changes, or a bare `{heartbeat:true}` no-op — each valid update
+    publishes to the hub.
+  - `GET /ws/commuter?route_id=<id>` — **deliberately public, no auth** (see
+    decision below). Subscribes to the hub for that route, sends an initial
+    `{"type":"snapshot","vehicles":[...]}` of currently-online vehicles on
+    that route, then streams `{"type":"update","vehicle":{...}}` /
+    `{"type":"offline","vehicle_id":"..."}` events as they're published. A
+    background goroutine drains incoming WS frames (gorilla requires an
+    active reader to detect the peer closing) while the main goroutine
+    selects between the hub channel and that close signal — one writer,
+    one reader per connection, satisfying gorilla's concurrency contract.
+  - `GET /telemetry/vehicles?route_id=<id>` — plain REST snapshot (no WS),
+    for debugging and a map's initial load.
+  - `POST /telemetry/seats` (driver only, behind `RequireAuth` +
+    `RequireRole(driver)`) — `{delta}` or `{seats_available}`, an
+    alternative to sending seat changes over the driver's own WS stream.
+    Resolves the caller's active vehicle assignment the same way `DriverWS`
+    does; 409 if that vehicle isn't currently online in the store (i.e. no
+    live `/ws/driver` connection for it).
+- `backend/internal/identity/repo.go` — added `GetVehicleByID` and
+  `GetActiveVehicleAssignmentByDriverID` (both reused by telemetry;
+  `GetActiveVehicleAssignmentByDriverID` relies on Stage 1's partial unique
+  index guaranteeing at most one active assignment per driver).
+- `backend/internal/server/router.go`, `backend/cmd/server/main.go` — wired
+  `telemetry.NewVehicleStateStore`/`NewHub`/`NewHandlers` alongside the
+  existing modules; `NewRouter` gained a `telemetryHandlers` parameter
+  (`health_test.go` updated to match, same as every prior stage).
+- `backend/cmd/wsdriver/main.go`, `backend/cmd/wscommuter/main.go` —
+  standalone `go run`-able CLI clients for manual end-to-end verification
+  without a browser (PowerShell can't easily drive raw WebSockets). See
+  "Verified" below for exact commands.
+- Tests:
+  - `backend/internal/telemetry/store_test.go` — pure unit tests, no DB:
+    `TestConcurrentUpdatesAndReads` (many goroutines doing position
+    updates, seat deltas, route-snapshot reads, and online/offline churn
+    against a shared store concurrently — asserts no data loss/corruption
+    after `wg.Wait()`, run with `-race` to catch data races — see the
+    known local-environment limitation below), `TestSeatClampingNeverExceedsBounds`
+    (delta and absolute writes both clamp to `[0, seats_total]`),
+    `TestGoOfflineRemovesFromRouteSnapshot`, `TestUpdatePositionOnUntrackedVehicleFails`.
+  - `backend/internal/telemetry/integration_test.go` — against a real
+    Postgres (skips if unreachable, same pattern as every prior stage) and
+    real WebSocket connections over `httptest.NewServer`:
+    `TestDriverUpdatePropagatesToCommuterOnSameRoute` — a commuter on the
+    driver's route receives the initial empty snapshot, then an `update`
+    event the instant the driver connects (vehicle online, correct
+    `seats_total`), then a position update, then a seat-delta update,
+    confirms the REST snapshot agrees while online, then an `offline` event
+    the instant the driver's connection closes — while a commuter
+    subscribed to a *different* route receives none of it, proving
+    per-route isolation. `TestDriverWSRejectsWrongRole` — a commuter JWT is
+    rejected with 403 on `/ws/driver`.
+
+Decisions / deviations from the original plan:
+- **`GET /ws/commuter` requires no auth.** Live position/seat-state isn't
+  sensitive the way wallet/fare data is, and a commuter should be able to
+  see the live map before logging in — this mirrors Stage 3's decision to
+  leave `GET /routes*` public rather than the "everything behind auth"
+  default. `GET /telemetry/vehicles` (its REST-snapshot counterpart) is
+  public for the same reason.
+- **JWT for `/ws/driver` is validated manually inside the handler, not via
+  `identity.RequireAuth` middleware**, since the handshake needs to
+  authenticate before `Upgrade()` runs and there's no clean way to run
+  chi middleware "before upgrade, after auth" here. This also required
+  supporting the token via a `token` query param (in addition to the
+  `Authorization` header) since browsers' `WebSocket` constructor cannot
+  set custom request headers — an unavoidable constraint of the WS
+  handshake, not a shortcut.
+- **"Going online" requires `route_id` up front on the WS URL**, not a
+  separate prior "go online" REST call — the brief allowed either, and
+  folding it into the WS connect keeps the state machine simpler (one
+  fewer place where "online but no route" could exist).
+- **Slow-consumer handling is "drop", not "coalesce."** `Hub.Publish` uses
+  a non-blocking buffered-channel send (32-deep) and simply skips a
+  subscriber whose mailbox is full, rather than replacing its oldest
+  buffered message with the newest. Simpler to reason about and correct
+  for an MVP demo's traffic levels; a coalescing hub (keep only the latest
+  per-vehicle event) would be the natural upgrade if commuter fan-out ever
+  needs to scale further.
+Verified: `go build ./...`, `go vet ./...`, `gofmt -l .`, and `go mod tidy`
+(added `github.com/gorilla/websocket` cleanly, no other diff) all pass. Full
+test suite (`go test ./...`), including the telemetry unit and
+WebSocket-over-`httptest` integration tests, passes against a live
+Postgres. `go test -race ./...` also passes cleanly across every package
+(including `internal/telemetry`) with **no data races detected**, once a C
+toolchain (MSYS2's `ucrt64` gcc) was installed on this dev machine —
+confirming `VehicleStateStore`'s single-`sync.RWMutex`/always-copy-in-out
+design and `Hub`'s `RWMutex`-guarded subscriber map hold up under the race
+detector, not just the plain test runner. No race-related findings, so no
+code changes were needed as a result of running it. End-to-end verified by hand: started the server, ran `cmd/seed`,
+logged in as a seeded driver, ran `cmd/wsdriver` against a seeded route to
+go online and stream simulated positions, ran `cmd/wscommuter` against the
+same route in a second terminal and watched it receive the snapshot →
+online update → position updates live, confirmed a `cmd/wscommuter` on a
+*different* route saw nothing, confirmed `GET /telemetry/vehicles` reflected
+the same live state over plain REST, and confirmed killing `cmd/wsdriver`
+(Ctrl+C) made the vehicle disappear from both the commuter WS stream
+(`offline` event) and the REST snapshot.
+
+Next: Stage 5 — boarding (QR scan)
