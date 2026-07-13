@@ -12,6 +12,7 @@ import (
 
 	"sesfikile/backend/internal/config"
 	"sesfikile/backend/internal/identity"
+	"sesfikile/backend/internal/routing"
 	"sesfikile/backend/internal/wallet"
 )
 
@@ -27,7 +28,8 @@ func testRouter(pinger Pinger) chi.Router {
 	tokens := identity.NewTokenIssuer("test-secret")
 	handlers := identity.NewHandlers(identity.NewRepo(nil), tokens)
 	walletHandlers := wallet.NewHandlers(wallet.NewRepo(nil), config.FareSplit{PlatformPct: 10, DriverPct: 25, OwnerPct: 65})
-	return NewRouter(pinger, handlers, tokens, walletHandlers)
+	routingHandlers := routing.NewHandlers(routing.NewRepo(nil))
+	return NewRouter(pinger, handlers, tokens, walletHandlers, routingHandlers)
 }
 
 func TestHealthHandler_Healthy(t *testing.T) {

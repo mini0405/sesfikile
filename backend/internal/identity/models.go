@@ -51,26 +51,26 @@ type User struct {
 // PRDPVerified and KYCStatus are stored fields only for the MVP — no real
 // verification workflow is wired up yet (see CLAUDE.md "SCOPE HONESTY").
 type Driver struct {
-	ID            uuid.UUID
-	UserID        uuid.UUID
-	FullName      string
-	PRDPNumber    string
-	PRDPVerified  bool
-	IDNumber      string
-	KYCStatus     KYCStatus
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID           uuid.UUID
+	UserID       uuid.UUID
+	FullName     string
+	PRDPNumber   string
+	PRDPVerified bool
+	IDNumber     string
+	KYCStatus    KYCStatus
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 }
 
 type Vehicle struct {
-	ID                uuid.UUID
-	OwnerUserID       uuid.UUID
-	Registration      string
-	Capacity          int
-	AssociationName   *string
-	ComplianceStatus  ComplianceStatus
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	ID               uuid.UUID
+	OwnerUserID      uuid.UUID
+	Registration     string
+	Capacity         int
+	AssociationName  *string
+	ComplianceStatus ComplianceStatus
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
 }
 
 type VehicleAssignment struct {

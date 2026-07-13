@@ -13,6 +13,7 @@ import (
 	"sesfikile/backend/internal/config"
 	"sesfikile/backend/internal/db"
 	"sesfikile/backend/internal/identity"
+	"sesfikile/backend/internal/routing"
 	"sesfikile/backend/internal/server"
 	"sesfikile/backend/internal/wallet"
 )
@@ -47,7 +48,10 @@ func main() {
 	}
 	walletHandlers := wallet.NewHandlers(walletRepo, cfg.FareSplit)
 
-	router := server.NewRouter(database, identityHandlers, tokens, walletHandlers)
+	routingRepo := routing.NewRepo(database.Pool)
+	routingHandlers := routing.NewHandlers(routingRepo)
+
+	router := server.NewRouter(database, identityHandlers, tokens, walletHandlers, routingHandlers)
 
 	httpServer := &http.Server{
 		Addr:    ":" + cfg.Port,

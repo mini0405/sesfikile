@@ -15,6 +15,7 @@ import (
 	"sesfikile/backend/internal/config"
 	"sesfikile/backend/internal/db"
 	"sesfikile/backend/internal/identity"
+	"sesfikile/backend/internal/routing"
 	"sesfikile/backend/internal/wallet"
 )
 
@@ -44,6 +45,7 @@ func main() {
 
 	repo := identity.NewRepo(pool)
 	walletRepo := wallet.NewRepo(pool)
+	routingRepo := routing.NewRepo(pool)
 
 	if err := walletRepo.EnsureSystemAccounts(ctx); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to seed system accounts: %v\n", err)
@@ -103,6 +105,11 @@ func main() {
 		}
 	}
 
+	if err := routing.SeedCorridors(ctx, routingRepo); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to seed routing corridors: %v\n", err)
+		os.Exit(1)
+	}
+
 	fmt.Println("Seed complete.")
 	fmt.Println()
 	fmt.Println("SEEDED DATA")
@@ -136,6 +143,72 @@ func main() {
 		driver1Record.FullName, driver1Record.ID, driver1User.ID, vehicle1.Registration, vehicle1.ID)
 	fmt.Printf("  %-14s id=%s   user_id=%s   vehicle=%s (%s)\n",
 		driver2Record.FullName, driver2Record.ID, driver2User.ID, vehicle2.Registration, vehicle2.ID)
+	fmt.Println()
+
+	printRoutingSummary(ctx, routingRepo)
+}
+
+// printRoutingSummary prints the seeded stops, routes (with ordered
+// legs/fares), and a note on which stops are interchanges — everything a
+// developer needs to exercise GET /routes/search by hand.
+func printRoutingSummary(ctx context.Context, repo *routing.Repo) {
+	stops, err := repo.ListStops(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to list stops: %v\n", err)
+		os.Exit(1)
+	}
+	routes, err := repo.AllRoutesWithLegs(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to list routes: %v\n", err)
+		os.Exit(1)
+	}
+
+	stopNames := map[uuid.UUID]string{}
+	for _, s := range stops {
+		stopNames[s.ID] = s.Name
+	}
+
+	fmt.Println("Stops:")
+	for _, s := range stops {
+		fmt.Printf("  %-30s id=%s\n", s.Name, s.ID)
+	}
+	fmt.Println()
+
+	fmt.Println("Routes:")
+	for _, rwl := range routes {
+		fmt.Printf("  %s (%s) id=%s\n", rwl.Route.Name, rwl.Route.AssociationName, rwl.Route.ID)
+		for _, l := range rwl.Legs {
+			fmt.Printf("    seq=%d  %s -> %s  fare_cents=%d\n", l.Sequence, stopNames[l.FromStopID], stopNames[l.ToStopID], l.FareCents)
+		}
+	}
+	fmt.Println()
+
+	// Interchanges are computed from ForwardCorridors only, not from every
+	// seeded route row — a corridor and its own return-trip route share
+	// every stop by construction, which would otherwise make every stop
+	// look like an "interchange". See routing.ForwardCorridors' doc comment.
+	fmt.Println("Interchanges (stops shared by more than one corridor):")
+	corridorsByStop := map[string]int{}
+	for _, corridor := range routing.ForwardCorridors {
+		seen := map[string]bool{}
+		mark := func(stopName string) {
+			if !seen[stopName] {
+				seen[stopName] = true
+				corridorsByStop[stopName]++
+			}
+		}
+		if len(corridor.Legs) > 0 {
+			mark(corridor.Legs[0].FromStop)
+		}
+		for _, l := range corridor.Legs {
+			mark(l.ToStop)
+		}
+	}
+	for _, s := range stops {
+		if corridorsByStop[s.Name] > 1 {
+			fmt.Printf("  %-30s id=%s\n", s.Name, s.ID)
+		}
+	}
 }
 
 func seedOrGetDriver(ctx context.Context, repo *identity.Repo, userID uuid.UUID, fullName, prdpNumber, idNumber string) identity.Driver {

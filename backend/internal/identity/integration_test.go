@@ -3,6 +3,7 @@ package identity_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -51,7 +52,10 @@ func TestRegisterLoginMe(t *testing.T) {
 		r.Get("/me", handlers.Me)
 	})
 
-	phone := "+27821110000"
+	// A fixed phone number would collide with the row a previous run left
+	// behind in a persistent (not reset-between-runs) database — see
+	// wallet.uniquePhone's doc comment for the same reasoning.
+	phone := fmt.Sprintf("+27%d", time.Now().UnixNano())
 	registerBody := `{"phone":"` + phone + `","password":"IntegrationTest123!","role":"commuter"}`
 
 	req := httptest.NewRequest(http.MethodPost, "/auth/register", strings.NewReader(registerBody))

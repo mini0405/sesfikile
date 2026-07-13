@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -63,14 +64,18 @@ func setup(t *testing.T) *testEnv {
 	return env
 }
 
-var seedCounter int
-var seedCounterMu sync.Mutex
+var uniqueCounter int64
 
+// uniquePhone returns a value unique both within this test binary run and
+// across repeated runs against the same (persistent, not reset-between-runs)
+// database. A plain in-process counter restarting at 1 every run would
+// collide with rows a previous run already left behind; combining a
+// per-call nanosecond timestamp with an atomic counter avoids that (and the
+// atomic counter alone guards against two calls landing in the same
+// nanosecond).
 func uniquePhone(prefix string) string {
-	seedCounterMu.Lock()
-	defer seedCounterMu.Unlock()
-	seedCounter++
-	return fmt.Sprintf("+27%09d%s", seedCounter, prefix)
+	n := atomic.AddInt64(&uniqueCounter, 1)
+	return fmt.Sprintf("+27%d%d%s", time.Now().UnixNano(), n, prefix)
 }
 
 func mustCreateCommuter(t *testing.T, env *testEnv) identity.User {

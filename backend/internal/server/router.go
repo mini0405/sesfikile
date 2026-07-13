@@ -5,10 +5,11 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"sesfikile/backend/internal/identity"
+	"sesfikile/backend/internal/routing"
 	"sesfikile/backend/internal/wallet"
 )
 
-func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identity.TokenIssuer, walletHandlers *wallet.Handlers) chi.Router {
+func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identity.TokenIssuer, walletHandlers *wallet.Handlers, routingHandlers *routing.Handlers) chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -17,6 +18,10 @@ func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identi
 
 	r.Post("/auth/register", identityHandlers.Register)
 	r.Post("/auth/login", identityHandlers.Login)
+
+	r.Get("/routes", routingHandlers.ListRoutes)
+	r.Get("/routes/search", routingHandlers.Search)
+	r.Get("/routes/{id}", routingHandlers.GetRoute)
 
 	r.Group(func(r chi.Router) {
 		r.Use(identity.RequireAuth(tokens))

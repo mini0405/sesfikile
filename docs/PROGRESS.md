@@ -206,3 +206,170 @@ once) → `GET /wallet/balance`.
 ---
 
 Next: Stage 3 — routing
+
+---
+
+## Stage 3 — routing — DONE (2026-07-13)
+
+Built:
+- `backend/migrations/000003_routing_schema.{up,down}.sql`:
+  - `stops` — `id`, `name`, `latitude`/`longitude` (float8), `created_at`.
+  - `routes` — `id`, `name`, `association_name`, `created_at`.
+  - `route_legs` — `id`, `route_id` FK, `from_stop_id`/`to_stop_id` FK, `sequence` int,
+    `fare_cents` int64, `created_at`. `UNIQUE (route_id, sequence)`.
+  - **SCOPE HONESTY** (per CLAUDE.md): the migration and seed data are both commented as a
+    hand-seeded, representative sample of Cape Town taxi corridors for demo purposes — NOT
+    association-approved or authoritative. Real association routing sign-off is an open
+    dependency.
+- `backend/internal/routing/` — the routing module:
+  - `models.go`, `repo.go` (plain CRUD/list queries; `AllRoutesWithLegs` loads every route +
+    ordered legs in one call — the seeded dataset is small enough to search entirely in Go
+    rather than express the path search as SQL).
+  - `graph.go` — the pure, DB-free search algorithm (`Search(routes, origin, dest)`):
+    - A route is only walkable in **increasing `sequence` order** — it models a real minibus
+      taxi corridor that runs in one fixed direction, not a bidirectional graph edge. Asking
+      for the reverse direction correctly finds no path.
+    - **Path-selection ordering: fewest transfers first, then lowest fare.** Direct (0
+      transfers) is always checked and preferred over any transfer path, even if a transfer
+      path would be cheaper. Among 0-transfer candidates (multiple routes both containing
+      origin and dest), the lowest-fare one wins; same for 1-transfer candidates.
+    - **Supports at most one transfer** (one interchange stop), per the stage brief — this is
+      a deliberate scope limit, not a general shortest-path implementation. A 2+ transfer
+      itinerary will report no path even if one theoretically exists.
+    - No path → `Search` returns `ok=false`; the handler turns this into a 404 with a JSON
+      error body, not a 500.
+  - `handlers.go`:
+    - `GET /routes` — list of routes (id, name, association_name).
+    - `GET /routes/{id}` — a route's ordered legs, each annotated with from/to stop names
+      (looked up in one extra query) — useful for rendering a route on the commuter map later.
+    - `GET /routes/search?from=<stop id or name>&to=<stop id or name>` — accepts either a
+      stop UUID or an exact stop name for `from`/`to` (kept simple, no fuzzy matching).
+      Returns `{transfers, total_fare_cents, segments: [{route_id, route_name, legs, fare_cents}]}`.
+      404 with an error body if no path exists.
+  - None of these routes require auth — route/fare data is public reference data, unlike
+    wallet/fare endpoints.
+- `backend/internal/server/router.go`, `backend/cmd/server/main.go` — wired
+  `routing.NewRepo`/`routing.NewHandlers` in alongside identity/wallet; `NewRouter` gained a
+  `routingHandlers` parameter (existing `health_test.go` updated to match).
+- `backend/internal/routing/seed_data.go` — the canonical demo route/stop data, exported so
+  both `cmd/seed` and the test suite share one source of truth instead of duplicating it:
+  12 stops and 8 routes (4 forward Cape Town corridors + their 4 return trips — see the
+  "return trips" decision below) across Cape Town corridors:
+  - **Cape Town CBD – Khayelitsha** (5 legs, plus its return **Khayelitsha – Cape Town CBD**):
+    Cape Town Station → Woodstock → Athlone → Mitchells Plain Town Centre → Khayelitsha Site C
+    → Khayelitsha Town Centre.
+  - **Athlone – Wynberg** (2 legs, plus its return **Wynberg – Athlone**): Athlone → Claremont
+    → Wynberg.
+  - **Cape Town CBD – Bellville** (2 legs, plus its return **Bellville – Cape Town CBD**):
+    Cape Town Station → Parow → Bellville Station.
+  - **Wynberg – Muizenberg** (2 legs, plus its return **Muizenberg – Wynberg**): Wynberg →
+    Retreat → Muizenberg.
+  - `RouteSeed`/`reverseRoute` build each return route from its forward counterpart: same
+    stops, legs reversed, fares mirrored leg-for-leg.
+  - `SeedCorridors(ctx, repo)` does the actual idempotent seeding (stops/routes matched by
+    name — no DB uniqueness constraint on either, that name lookup is the idempotency check —
+    and a route's legs are only inserted the first time that route has none) and returns an
+    `error` instead of exiting, so it's callable from tests too.
+- `backend/cmd/seed/main.go` — now just calls `routing.SeedCorridors` and prints the SEEDED
+  DATA summary (all stops, all routes with ordered legs/fares, and which stops are
+  interchanges). Interchanges are computed from `routing.ForwardCorridors` only (not every
+  seeded route row), since a corridor and its own return trip share every stop by
+  construction and would otherwise make every stop look like an "interchange": **Athlone**
+  (CBD–Khayelitsha ⋂ Athlone–Wynberg), **Wynberg** (Athlone–Wynberg ⋂ Wynberg–Muizenberg), and
+  **Cape Town Station** (CBD–Khayelitsha ⋂ CBD–Bellville).
+- Tests:
+  - `backend/internal/routing/graph_test.go` — pure unit tests against synthetic in-memory
+    routes (no DB): direct path + fare sum, multi-hop via interchange, no-path (disconnected),
+    direction matters (reverse of a route finds nothing), direct preferred over a
+    cheaper-but-transferred alternative, same-stop origin/dest rejected.
+  - `backend/internal/routing/integration_test.go` — against a real Postgres (skips if
+    unreachable, matching Stage 0-2's pattern): seeds a small synthetic fixture (independent of
+    `cmd/seed`'s data, uniquely named per run) and exercises `Search` through the real repo
+    for direct, multi-hop, and no-path (reverse direction) cases. Since this runs against the
+    shared dev DB rather than a disposable one, the fixture rows are deleted via `t.Cleanup`
+    so they don't leak into `cmd/seed`'s output.
+  - `backend/internal/routing/corridor_test.go` — against the real seeded demo corridors
+    (`routing.SeedCorridors`, idempotent, not cleaned up afterward — same persistent data
+    `cmd/seed` itself writes): confirms the original direct search is unaffected by adding
+    return routes, confirms the new return-trip direction now succeeds with the mirrored
+    fare, confirms Khayelitsha Town Centre ↔ Bellville Station is now genuinely connected
+    (1 transfer via Cape Town Station — this pair used to be the stage's no-path example, see
+    decision below), and confirms Khayelitsha Town Centre ↔ Muizenberg is still correctly
+    unreachable within one transfer.
+
+Decisions / deviations from the original plan:
+- Chose **stop ids or exact stop names** for `from`/`to` (brief said "your call, keep it
+  simple") — no fuzzy/partial name matching.
+- Path search is implemented in Go over an in-memory load of all routes/legs rather than a
+  recursive SQL query — simpler to read and test, and fine at this dataset size; would need
+  revisiting if the route graph grows large.
+- Limited multi-hop support to exactly one transfer, as explicitly permitted by the brief.
+  The algorithm is a bounded search (all route pairs × shared stops) rather than a general
+  Dijkstra/BFS, since one transfer is the entire supported scope for the MVP.
+- `GET /routes*` endpoints are public (no `identity.RequireAuth`) since route/fare data isn't
+  sensitive, unlike the wallet endpoints — a deviation from the "everything behind auth"
+  pattern established in Stage 2, called out here since it's a deliberate choice.
+- **Return-trip travel is seeded as separate directional route rows rather than making the
+  graph bidirectional.** Real minibus taxi associations typically dispatch each direction as
+  its own route from its own rank (often with its own numbering, and potentially its own
+  fares), so a corridor and its return trip being two distinct route rows is the more
+  faithful model, not a simplification — matches how associations actually file routes per
+  direction and avoids added complexity/risk in the already-tested `Search` algorithm (which
+  needed zero changes: extra route rows just widen the search space it already walks). Fares
+  are mirrored leg-for-leg for now; a comment in `seed_data.go` flags that real per-direction
+  fares (e.g. peak-direction pricing) could differ. One consequence worth calling out: adding
+  the "Khayelitsha - Cape Town CBD" return route made Khayelitsha Town Centre ↔ Bellville
+  Station — this stage's original no-path example — genuinely connected (1 transfer via the
+  Cape Town Station interchange), since a real 1-transfer itinerary now exists. That's correct
+  behavior, not a bug; Khayelitsha Town Centre ↔ Muizenberg replaced it as the no-path example
+  (2 transfers apart even with return routes in place).
+
+Verified: `go build ./...`, `go vet ./...`, `gofmt -l .` (clean for routing code — the one
+`gofmt -l` hit is pre-existing in `internal/identity/models.go`, unrelated to this stage), and
+`go mod tidy` all pass with no `go.mod`/`go.sum` changes. Full test suite passes against a
+live Postgres, including the routing unit, integration, and real-corridor tests. End-to-end
+verified by hand: seeded, started the server, and curled a direct search (Cape Town Station →
+Khayelitsha Town Centre, 5 legs, 3500 cents, unaffected by adding return routes), a multi-hop
+search (Cape Town Station → Wynberg via the Athlone interchange, 1500 + 1100 = 2600 cents
+across two segments/routes), the new return-trip direction (Khayelitsha Town Centre → Cape
+Town Station, direct, mirrored fare 3500 cents), the newly-connected pair (Khayelitsha Town
+Centre → Bellville Station, 1 transfer via Cape Town Station, 3500 + 1100 = 4600 cents), a
+still-disconnected pair (Khayelitsha Town Centre → Muizenberg, clean 404), and `GET /routes`.
+
+**Follow-up test-hygiene fix (2026-07-13):** flagged during this stage's work — the wallet
+and identity integration tests (`backend/internal/wallet/ledger_test.go`,
+`backend/internal/identity/integration_test.go`) generated phone numbers from either a plain
+in-process counter (`seedCounter`, wallet) or a single hardcoded value (`+27821110000`,
+identity), both of which restart/repeat from scratch on every process run. Running the suite
+more than once against the same persistent Postgres (rather than a freshly reset one) made
+these tests collide with rows a previous run had already created and fail with
+"already exists" / 409s — only the routing tests (which already use a per-call
+`time.Now().UnixNano()` suffix) survived repeat runs unscathed.
+
+Fixed by generating identifiers the same way the routing tests do — unique per call, not
+reset per process — rather than adding cleanup: `wallet.uniquePhone` now combines
+`time.Now().UnixNano()` with an atomic counter (guards against two calls landing in the same
+nanosecond), and identity's `TestRegisterLoginMe` generates its phone the same way. No
+cleanup (`t.Cleanup`) was added on top of this: with truly unique identifiers the created rows
+never collide with anything else again, so cleanup would only be about tidying up a dev-only
+database, not correctness — and hand-written cascading deletes across
+accounts/ledger_transactions/ledger_postings turned out to be genuinely risky (see below), so
+skipping that trade was the safer call. This intentionally mirrors `routing/corridor_test.go`
+already leaving its (idempotent, reusable) seed rows in place rather than every DB-backed test
+in the repo cleaning up after itself.
+
+No test assertions changed — only how test data is provisioned. Confirmed: `go build ./...`,
+`go vet ./...`, `gofmt -l .` (same pre-existing `internal/identity/models.go` hit, unrelated),
+and `go mod tidy` all clean, and the full suite (`go test ./...`) passes three times in a row
+against the same live Postgres with no reset in between.
+
+**Aside (not a bug in the fix, informational only):** while investigating this, an attempt to
+hand-clean leftover test rows via direct SQL (deleting only the `ledger_postings` owned by
+test-created accounts, not the full set of postings for a shared transaction) tripped the
+Stage 2 zero-sum balance trigger, since a transaction's postings must be deleted as a complete
+set for the deferred check to see a balanced (empty) result. Postgres's transactional
+statement semantics rolled the failed statement back cleanly with no partial corruption, but
+it's a good demonstration of why this fix avoids ad-hoc/partial ledger deletions in test
+cleanup code.
+
+Next: Stage 4 — telemetry
