@@ -10,7 +10,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"sesfikile/backend/internal/config"
 	"sesfikile/backend/internal/identity"
+	"sesfikile/backend/internal/wallet"
 )
 
 type fakePinger struct {
@@ -24,7 +26,8 @@ func (f fakePinger) Ping(ctx context.Context) error {
 func testRouter(pinger Pinger) chi.Router {
 	tokens := identity.NewTokenIssuer("test-secret")
 	handlers := identity.NewHandlers(identity.NewRepo(nil), tokens)
-	return NewRouter(pinger, handlers, tokens)
+	walletHandlers := wallet.NewHandlers(wallet.NewRepo(nil), config.FareSplit{PlatformPct: 10, DriverPct: 25, OwnerPct: 65})
+	return NewRouter(pinger, handlers, tokens, walletHandlers)
 }
 
 func TestHealthHandler_Healthy(t *testing.T) {

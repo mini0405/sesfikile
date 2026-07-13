@@ -14,6 +14,7 @@ import (
 	"sesfikile/backend/internal/db"
 	"sesfikile/backend/internal/identity"
 	"sesfikile/backend/internal/server"
+	"sesfikile/backend/internal/wallet"
 )
 
 func main() {
@@ -38,7 +39,15 @@ func main() {
 	identityRepo := identity.NewRepo(database.Pool)
 	identityHandlers := identity.NewHandlers(identityRepo, tokens)
 
-	router := server.NewRouter(database, identityHandlers, tokens)
+	walletRepo := wallet.NewRepo(database.Pool)
+	if err := walletRepo.EnsureSystemAccounts(context.Background()); err != nil {
+		logger.Warn("skipping system account setup: database not reachable or setup failed", "error", err)
+	} else {
+		logger.Info("system accounts ready")
+	}
+	walletHandlers := wallet.NewHandlers(walletRepo, cfg.FareSplit)
+
+	router := server.NewRouter(database, identityHandlers, tokens, walletHandlers)
 
 	httpServer := &http.Server{
 		Addr:    ":" + cfg.Port,

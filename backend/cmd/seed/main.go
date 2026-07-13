@@ -15,6 +15,7 @@ import (
 	"sesfikile/backend/internal/config"
 	"sesfikile/backend/internal/db"
 	"sesfikile/backend/internal/identity"
+	"sesfikile/backend/internal/wallet"
 )
 
 type seedUser struct {
@@ -42,6 +43,12 @@ func main() {
 	defer pool.Close()
 
 	repo := identity.NewRepo(pool)
+	walletRepo := wallet.NewRepo(pool)
+
+	if err := walletRepo.EnsureSystemAccounts(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to seed system accounts: %v\n", err)
+		os.Exit(1)
+	}
 
 	owner := seedUser{"owner", "+27820000001", "owner@sesfikile.dev", "Owner123!", identity.RoleOwner}
 	driver1 := seedUser{"driver 1", "+27820000002", "driver1@sesfikile.dev", "Driver123!", identity.RoleDriver}
@@ -52,50 +59,119 @@ func main() {
 	ownerUser := seedOrGetUser(ctx, repo, owner)
 	driver1User := seedOrGetUser(ctx, repo, driver1)
 	driver2User := seedOrGetUser(ctx, repo, driver2)
-	seedOrGetUser(ctx, repo, commuter1)
-	seedOrGetUser(ctx, repo, commuter2)
+	commuter1User := seedOrGetUser(ctx, repo, commuter1)
+	commuter2User := seedOrGetUser(ctx, repo, commuter2)
 
-	driver1Record, err := repo.CreateDriver(ctx, driver1User.ID, "Thabo Nkosi", "PRDP0001", "8001015800083")
-	if err != nil && !errors.Is(err, identity.ErrAlreadyExists) {
-		fmt.Fprintf(os.Stderr, "failed to seed driver 1 profile: %v\n", err)
-		os.Exit(1)
-	}
-	driver2Record, err := repo.CreateDriver(ctx, driver2User.ID, "Sipho Dlamini", "PRDP0002", "8505124800089")
-	if err != nil && !errors.Is(err, identity.ErrAlreadyExists) {
-		fmt.Fprintf(os.Stderr, "failed to seed driver 2 profile: %v\n", err)
-		os.Exit(1)
-	}
+	driver1Record := seedOrGetDriver(ctx, repo, driver1User.ID, "Thabo Nkosi", "PRDP0001", "8001015800083")
+	driver2Record := seedOrGetDriver(ctx, repo, driver2User.ID, "Sipho Dlamini", "PRDP0002", "8505124800089")
 
 	assoc := "Cape Town Minibus Taxi Association"
-	vehicle1, err := repo.CreateVehicle(ctx, ownerUser.ID, "CA123456", 16, &assoc)
-	if err != nil && !errors.Is(err, identity.ErrAlreadyExists) {
-		fmt.Fprintf(os.Stderr, "failed to seed vehicle 1: %v\n", err)
+	vehicle1 := seedOrGetVehicle(ctx, repo, ownerUser.ID, "CA123456", 16, &assoc)
+	vehicle2 := seedOrGetVehicle(ctx, repo, ownerUser.ID, "CA654321", 16, &assoc)
+
+	if _, err := repo.CreateVehicleAssignment(ctx, vehicle1.ID, driver1Record.ID); err != nil && !errors.Is(err, identity.ErrAlreadyExists) {
+		fmt.Fprintf(os.Stderr, "failed to assign driver 1 to vehicle 1: %v\n", err)
 		os.Exit(1)
 	}
-	vehicle2, err := repo.CreateVehicle(ctx, ownerUser.ID, "CA654321", 16, &assoc)
-	if err != nil && !errors.Is(err, identity.ErrAlreadyExists) {
-		fmt.Fprintf(os.Stderr, "failed to seed vehicle 2: %v\n", err)
+	if _, err := repo.CreateVehicleAssignment(ctx, vehicle2.ID, driver2Record.ID); err != nil && !errors.Is(err, identity.ErrAlreadyExists) {
+		fmt.Fprintf(os.Stderr, "failed to assign driver 2 to vehicle 2: %v\n", err)
 		os.Exit(1)
 	}
 
-	if driver1Record.ID != uuid.Nil && vehicle1.ID != uuid.Nil {
-		if _, err := repo.CreateVehicleAssignment(ctx, vehicle1.ID, driver1Record.ID); err != nil && !errors.Is(err, identity.ErrAlreadyExists) {
-			fmt.Fprintf(os.Stderr, "failed to assign driver 1 to vehicle 1: %v\n", err)
+	// Starting wallet balance is seeded via a real top-up transaction (not a
+	// raw balance write), so it's a normal, invariant-respecting ledger entry.
+	// Only top up once per commuter — re-running seed must stay a no-op, and
+	// a top-up has no idempotency key to dedupe on, so we gate on balance.
+	const startingBalanceCents = 10000 // R100.00
+	for _, u := range []identity.User{commuter1User, commuter2User} {
+		acc, err := walletRepo.GetOrCreateAccount(ctx, pool, &u.ID, wallet.AccountCommuterWallet)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to load wallet account for %s: %v\n", u.Phone, err)
 			os.Exit(1)
 		}
-	}
-	if driver2Record.ID != uuid.Nil && vehicle2.ID != uuid.Nil {
-		if _, err := repo.CreateVehicleAssignment(ctx, vehicle2.ID, driver2Record.ID); err != nil && !errors.Is(err, identity.ErrAlreadyExists) {
-			fmt.Fprintf(os.Stderr, "failed to assign driver 2 to vehicle 2: %v\n", err)
+		balance, err := walletRepo.AccountBalance(ctx, pool, acc.ID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "failed to read balance for %s: %v\n", u.Phone, err)
+			os.Exit(1)
+		}
+		if balance > 0 {
+			continue
+		}
+		if _, _, err := walletRepo.Topup(ctx, u.ID, startingBalanceCents); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to seed starting balance for %s: %v\n", u.Phone, err)
 			os.Exit(1)
 		}
 	}
 
-	fmt.Println("Seed complete. Dev logins (POST /auth/login with phone + password):")
+	fmt.Println("Seed complete.")
 	fmt.Println()
-	for _, u := range []seedUser{owner, driver1, driver2, commuter1, commuter2} {
-		fmt.Printf("  %-12s phone=%-15s password=%-14s role=%s\n", u.label, u.phone, u.password, u.role)
+	fmt.Println("SEEDED DATA")
+	fmt.Println("===========")
+	fmt.Println()
+
+	fmt.Println("Logins (POST /auth/login with phone + password):")
+	users := []struct {
+		seedUser
+		user identity.User
+	}{
+		{owner, ownerUser},
+		{driver1, driver1User},
+		{driver2, driver2User},
+		{commuter1, commuter1User},
+		{commuter2, commuter2User},
 	}
+	for _, u := range users {
+		fmt.Printf("  %-12s phone=%-15s password=%-14s role=%-9s user_id=%s\n",
+			u.label, u.phone, u.password, u.role, u.user.ID)
+	}
+	fmt.Println()
+
+	fmt.Println("Vehicles:")
+	fmt.Printf("  %-10s id=%s   owner=%s (%s)\n", vehicle1.Registration, vehicle1.ID, owner.label, ownerUser.ID)
+	fmt.Printf("  %-10s id=%s   owner=%s (%s)\n", vehicle2.Registration, vehicle2.ID, owner.label, ownerUser.ID)
+	fmt.Println()
+
+	fmt.Println("Drivers:")
+	fmt.Printf("  %-14s id=%s   user_id=%s   vehicle=%s (%s)\n",
+		driver1Record.FullName, driver1Record.ID, driver1User.ID, vehicle1.Registration, vehicle1.ID)
+	fmt.Printf("  %-14s id=%s   user_id=%s   vehicle=%s (%s)\n",
+		driver2Record.FullName, driver2Record.ID, driver2User.ID, vehicle2.Registration, vehicle2.ID)
+}
+
+func seedOrGetDriver(ctx context.Context, repo *identity.Repo, userID uuid.UUID, fullName, prdpNumber, idNumber string) identity.Driver {
+	driver, err := repo.CreateDriver(ctx, userID, fullName, prdpNumber, idNumber)
+	if err == nil {
+		return driver
+	}
+	if !errors.Is(err, identity.ErrAlreadyExists) {
+		fmt.Fprintf(os.Stderr, "failed to seed driver profile for %s: %v\n", fullName, err)
+		os.Exit(1)
+	}
+
+	existing, err := repo.GetDriverByUserID(ctx, userID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to load existing driver profile for %s: %v\n", fullName, err)
+		os.Exit(1)
+	}
+	return existing
+}
+
+func seedOrGetVehicle(ctx context.Context, repo *identity.Repo, ownerUserID uuid.UUID, registration string, capacity int, associationName *string) identity.Vehicle {
+	vehicle, err := repo.CreateVehicle(ctx, ownerUserID, registration, capacity, associationName)
+	if err == nil {
+		return vehicle
+	}
+	if !errors.Is(err, identity.ErrAlreadyExists) {
+		fmt.Fprintf(os.Stderr, "failed to seed vehicle %s: %v\n", registration, err)
+		os.Exit(1)
+	}
+
+	existing, err := repo.GetVehicleByRegistration(ctx, registration)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to load existing vehicle %s: %v\n", registration, err)
+		os.Exit(1)
+	}
+	return existing
 }
 
 func seedOrGetUser(ctx context.Context, repo *identity.Repo, u seedUser) identity.User {

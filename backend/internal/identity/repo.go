@@ -77,6 +77,22 @@ func (r *Repo) GetUserByID(ctx context.Context, id uuid.UUID) (User, error) {
 	return u, nil
 }
 
+func (r *Repo) GetDriverByUserID(ctx context.Context, userID uuid.UUID) (Driver, error) {
+	var d Driver
+	err := r.pool.QueryRow(ctx,
+		`SELECT id, user_id, full_name, prdp_number, prdp_verified, id_number, kyc_status, created_at, updated_at
+		 FROM drivers WHERE user_id = $1`,
+		userID,
+	).Scan(&d.ID, &d.UserID, &d.FullName, &d.PRDPNumber, &d.PRDPVerified, &d.IDNumber, &d.KYCStatus, &d.CreatedAt, &d.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Driver{}, ErrNotFound
+		}
+		return Driver{}, err
+	}
+	return d, nil
+}
+
 func (r *Repo) CreateDriver(ctx context.Context, userID uuid.UUID, fullName, prdpNumber, idNumber string) (Driver, error) {
 	var d Driver
 	err := r.pool.QueryRow(ctx,
@@ -92,6 +108,22 @@ func (r *Repo) CreateDriver(ctx context.Context, userID uuid.UUID, fullName, prd
 		return Driver{}, err
 	}
 	return d, nil
+}
+
+func (r *Repo) GetVehicleByRegistration(ctx context.Context, registration string) (Vehicle, error) {
+	var v Vehicle
+	err := r.pool.QueryRow(ctx,
+		`SELECT id, owner_user_id, registration, capacity, association_name, compliance_status, created_at, updated_at
+		 FROM vehicles WHERE registration = $1`,
+		registration,
+	).Scan(&v.ID, &v.OwnerUserID, &v.Registration, &v.Capacity, &v.AssociationName, &v.ComplianceStatus, &v.CreatedAt, &v.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Vehicle{}, ErrNotFound
+		}
+		return Vehicle{}, err
+	}
+	return v, nil
 }
 
 func (r *Repo) CreateVehicle(ctx context.Context, ownerUserID uuid.UUID, registration string, capacity int, associationName *string) (Vehicle, error) {
