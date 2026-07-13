@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: sesfikile-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: sesfikile
+      POSTGRES_PASSWORD: sesfikile_dev
+      POSTGRES_DB: sesfikile
+    ports:
+      - "5432:5432"
+    volumes:
+      - sesfikile_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sesfikile -d sesfikile"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  sesfikile_pgdata:

@@ -30,3 +30,18 @@ Modules: identity, wallet, routing, telemetry, fuel, analytics.
 ## Build stages
 0 scaffold+infra · 1 identity · 2 wallet+ledger · 3 routing · 4 telemetry ·
 5 boarding (QR scan) · 6 request-a-stop · 7 fuel (mock) · 8 owner dashboard · 9 polish+offline
+
+### Stage 0 — done
+- Monorepo skeleton: `apps/{commuter,driver,owner}`, `packages/shared`, `docs` (placeholders only).
+- `backend/` Go module (`sesfikile/backend`): `cmd/server`, `internal/{config,db,server}`.
+- `GET /health` — 200 `{"status":"ok","db":"ok"}` when Postgres is reachable, 503
+  `{"status":"degraded","db":"down"}` otherwise. Server always starts even if Postgres is down
+  (pgxpool connects lazily; only `/health` actually pings).
+- Graceful shutdown via `signal.NotifyContext` (SIGINT/SIGTERM).
+- `infra/docker-compose.yml`: Postgres 16, container `sesfikile-postgres`, user/pass/db
+  `sesfikile`/`sesfikile_dev`/`sesfikile`, port 5432, named volume, `pg_isready` healthcheck.
+- Tests: `internal/config` (env defaults/overrides), `internal/server` (health handler, both
+  branches via a fake pinger — no live DB needed). `go build ./...` and `go test ./...` pass.
+- Known local env quirk: this dev machine also has a native Windows PostgreSQL 18 service
+  bound to port 5432, which will shadow the Docker container on `localhost:5432` if both run
+  at once — stop that service (or free the port) before using the Compose Postgres.
