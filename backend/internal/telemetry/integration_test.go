@@ -51,7 +51,8 @@ func setupTelemetryTest(t *testing.T) (*identity.Repo, *routing.Repo, identity.T
 
 	store := telemetry.NewVehicleStateStore()
 	hub := telemetry.NewHub()
-	handlers := telemetry.NewHandlers(store, hub, identityRepo, routingRepo, tokens)
+	alerts := telemetry.NewDriverAlertHub()
+	handlers := telemetry.NewHandlers(store, hub, alerts, identityRepo, routingRepo, tokens)
 
 	r := chi.NewRouter()
 	r.Get("/ws/driver", handlers.DriverWS)

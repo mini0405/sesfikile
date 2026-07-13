@@ -27,16 +27,18 @@ import (
 type Handlers struct {
 	store        *VehicleStateStore
 	hub          *Hub
+	alerts       *DriverAlertHub
 	identityRepo *identity.Repo
 	routingRepo  *routing.Repo
 	tokens       identity.TokenIssuer
 	upgrader     websocket.Upgrader
 }
 
-func NewHandlers(store *VehicleStateStore, hub *Hub, identityRepo *identity.Repo, routingRepo *routing.Repo, tokens identity.TokenIssuer) *Handlers {
+func NewHandlers(store *VehicleStateStore, hub *Hub, alerts *DriverAlertHub, identityRepo *identity.Repo, routingRepo *routing.Repo, tokens identity.TokenIssuer) *Handlers {
 	return &Handlers{
 		store:        store,
 		hub:          hub,
+		alerts:       alerts,
 		identityRepo: identityRepo,
 		routingRepo:  routingRepo,
 		tokens:       tokens,
@@ -145,28 +147,56 @@ func (h *Handlers) DriverWS(w http.ResponseWriter, r *http.Request) {
 		h.hub.Publish(routeID, Event{Type: EventOffline, VehicleID: vehicle.ID.String()})
 	}()
 
-	for {
-		var msg driverMessage
-		if err := conn.ReadJSON(&msg); err != nil {
-			return // client disconnected or sent garbage — end the session
-		}
+	// Bidirectional from here: this connection both reads position/seat
+	// updates from the driver AND receives server-pushed alerts (Stage 6's
+	// stop-requests). gorilla/websocket allows exactly one concurrent reader
+	// and one concurrent writer per connection, so reading happens on its
+	// own goroutine (forwarding decoded messages over a channel) while this
+	// goroutine is the sole writer, selecting between driver messages and
+	// pushed alerts — same single-writer discipline as CommuterWS.
+	alertSub := h.alerts.Subscribe(driver.ID)
+	defer h.alerts.Unsubscribe(alertSub)
 
-		var (
-			newState VehicleState
-			changed  bool
-		)
-		switch {
-		case msg.Lat != nil && msg.Lng != nil:
-			newState, changed = h.store.UpdatePosition(vehicle.ID, *msg.Lat, *msg.Lng)
-		case msg.SeatsAvailable != nil:
-			newState, changed = h.store.SetSeatsAbsolute(vehicle.ID, *msg.SeatsAvailable)
-		case msg.SeatsDelta != nil:
-			newState, changed = h.store.AdjustSeats(vehicle.ID, *msg.SeatsDelta)
-		default:
-			continue // heartbeat-only or empty message: nothing to broadcast
+	incoming := make(chan driverMessage, 1)
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		for {
+			var msg driverMessage
+			if err := conn.ReadJSON(&msg); err != nil {
+				return // client disconnected or sent garbage — end the session
+			}
+			incoming <- msg
 		}
-		if changed {
-			h.hub.Publish(routeID, Event{Type: EventUpdate, Vehicle: toView(newState)})
+	}()
+
+	for {
+		select {
+		case msg := <-incoming:
+			var (
+				newState VehicleState
+				changed  bool
+			)
+			switch {
+			case msg.Lat != nil && msg.Lng != nil:
+				newState, changed = h.store.UpdatePosition(vehicle.ID, *msg.Lat, *msg.Lng)
+			case msg.SeatsAvailable != nil:
+				newState, changed = h.store.SetSeatsAbsolute(vehicle.ID, *msg.SeatsAvailable)
+			case msg.SeatsDelta != nil:
+				newState, changed = h.store.AdjustSeats(vehicle.ID, *msg.SeatsDelta)
+			default:
+				continue // heartbeat-only or empty message: nothing to broadcast
+			}
+			if changed {
+				h.hub.Publish(routeID, Event{Type: EventUpdate, Vehicle: toView(newState)})
+			}
+		case alert := <-alertSub.ch:
+			conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := conn.WriteJSON(alert); err != nil {
+				return
+			}
+		case <-readDone:
+			return
 		}
 	}
 }

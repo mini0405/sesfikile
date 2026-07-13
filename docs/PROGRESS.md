@@ -730,3 +730,179 @@ seats 16→15 confirmed via `GET /telemetry/vehicles`), then scanned the
 `seats_remaining` still 15 (no double charge, no double decrement).
 
 Next: Stage 6 — request-a-stop
+
+---
+
+## Stage 6 — request-a-stop — DONE (2026-07-14)
+
+Built:
+- `backend/internal/telemetry/alerts.go` — `DriverAlertHub`, a per-driver
+  pub/sub mailbox registry, deliberately parallel to `Hub` (Stage 4) but
+  keyed by **driver id** instead of route id: `Subscribe(driverID)` hands
+  back a `*DriverAlertSub` with a buffered channel (8), and `Send(driverID,
+  msg)` does the same **non-blocking**, drop-on-full-mailbox send as
+  `Hub.Publish` — a stop-request publish must never block on a slow/stuck
+  driver connection. `Send` returns whether at least one mailbox actually
+  received the message, so a caller can tell "driver was truly reachable"
+  from "telemetry said online but the WS had just dropped."
+- `backend/internal/telemetry/handlers.go` — **`/ws/driver` is now
+  bidirectional.** Previously the connection only ever read from the driver
+  (position/seat updates) and never wrote anything back. It now also
+  subscribes to a `DriverAlertHub` mailbox for the caller's driver id and
+  pushes any alert queued there straight to the connection. Since
+  gorilla/websocket allows exactly one concurrent reader and one concurrent
+  writer per connection, the read loop moved onto its own goroutine
+  (forwarding decoded `driverMessage`s over an internal channel) while the
+  original goroutine becomes the sole writer, `select`-ing between incoming
+  driver messages, pushed alerts, and the read goroutine's exit signal —
+  the same single-writer discipline `CommuterWS` already used for its
+  hub-fan-out select loop. `NewHandlers` gained a `*DriverAlertHub`
+  parameter (all three call sites — `cmd/server/main.go`,
+  `internal/server/health_test.go`, `internal/telemetry/integration_test.go`
+  — updated to match).
+- `backend/internal/stops/` — the new stops module, built entirely on top
+  of existing infrastructure (no new persistence layer, no duplicated
+  lookups):
+  - `models.go` — `Request{ID, CommuterID, RouteID, StopID, StopName,
+    RequestedAt, Status, MatchedDriverID, AckedAt}`. `Status` is one of
+    `pending` (matched + alert delivered, awaiting ack), `unmatched` (no
+    qualifying driver was reachable), `acknowledged`.
+  - `store.go` — `Store`, an in-memory `map[uuid.UUID]Request` guarded by a
+    single `RWMutex`, same shape as `telemetry.VehicleStateStore`.
+    **In-memory only — resets on server restart**, same accepted MVP
+    trade-off already made for Stage 4's live vehicle state (see CLAUDE.md
+    SCOPE HONESTY).
+  - `geo.go` — `haversineMeters`, the one distance primitive the matching
+    rule needs.
+  - `match.go` — the pure, DB-free matching algorithm (`FindApproachingDriver`),
+    unit-tested with synthetic data (no DB, no WS):
+    - **Approaching-driver rule** (documented in code, deliberately simple,
+      per the stage brief's "approximate position-to-sequence mapping is
+      fine — note the approximation"): a route's stops are given a 0-based
+      sequence index (`StopSequenceIndex`) from its ordered legs (Stage 3).
+      A driver's current route-progress is approximated as
+      **`nearestStopIndex`** — the index of the geographically nearest stop
+      (straight-line/haversine distance) to their last reported lat/lng.
+      This is **not** true map-matching or geofencing: a driver just past a
+      stop but still physically closer to it than to the next one reads as
+      "at" that stop, not "just past" it. A driver qualifies as
+      "approaching" a requested stop if `nearestStopIndex <=
+      targetStopIndex` — i.e. they have not (as far as this approximation
+      can tell) already passed it.
+    - **Selection rule**: among qualifying (approaching, online, same-route)
+      drivers, the one physically nearest (haversine distance from their
+      live position to the requested stop's own lat/lng) is chosen. **Only
+      one driver is alerted per request** in this MVP — simplest to reason
+      about for a first cut; alerting every qualifying driver would be the
+      natural extension if a single alerted driver turns out to be an
+      unreliable pickup in practice. Both decisions are the brief's "your
+      call" clauses, exercised and documented rather than left implicit.
+  - `handlers.go` — `Handlers.RequestStop` (`POST /stops/request`, commuter
+    only) and `Handlers.AckRequest` (`POST /stops/request/{id}/ack`, driver
+    only). `RequestStop`: resolves the route (404 if missing), builds the
+    route's ordered stop sequence from its legs (Stage 3,
+    `routing.Repo.ListLegsForRoute` + per-stop `GetStopByID` — the same
+    "small dataset, just loop" reasoning `routing.AllRoutesWithLegs` already
+    uses), 404s if the requested stop isn't on that route, pulls every
+    currently-online driver on the route from `telemetry.VehicleStateStore`
+    (Stage 4), runs `FindApproachingDriver`, and — if a driver qualifies —
+    pushes a `telemetry.AlertMessage{Type: "stop_request", RequestID,
+    RouteID, StopID, StopName, RequestedAt}` through `DriverAlertHub.Send`.
+    If no driver qualifies (or the matched driver's mailbox wasn't actually
+    reachable — see `DriverAlertHub.Send`'s return value), responds 200 with
+    `{status: "unmatched", driver_available: false}` — **a clean result, not
+    an error**, per the stage brief. A successful match responds 201 with
+    `{request_id, status: "pending", driver_available: true}`. `AckRequest`
+    resolves the caller's driver profile (Stage 1), 403s if they aren't the
+    request's `MatchedDriverID`, then calls `Store.Acknowledge` (idempotent —
+    acking an already-acknowledged request is a no-op, not an error, since a
+    driver double-tapping "picked up" shouldn't see a failure).
+  - **Commuter notification on ack is not implemented** — the stage brief
+    called this out as optional ("optionally notifies the commuter"). The
+    commuter's only live connection is the route-wide `/ws/commuter` stream
+    (vehicle telemetry, not per-request), and adding a commuter-specific
+    push channel for this one field felt like scope creep for an MVP demo;
+    a commuter can poll `GET /stops/request/{id}` in a later stage if this
+    needs surfacing. Flagged here rather than silently dropped.
+- `backend/internal/server/router.go` — wired `stops.Handlers` in:
+  `POST /stops/request` under the existing commuter `RequireRole` group,
+  `POST /stops/request/{id}/ack` under the existing driver `RequireRole`
+  group. `NewRouter` gained a `stopsHandlers` parameter (`health_test.go`
+  updated to match, same pattern as every prior stage).
+- `backend/cmd/server/main.go` — constructs `telemetry.NewDriverAlertHub()`
+  once (shared between `telemetry.NewHandlers` and `stops.NewHandlers`),
+  and `stops.NewStore()` / `stops.NewHandlers(...)`.
+- `backend/cmd/wsdriver/main.go` — since `/ws/driver` is now bidirectional,
+  the client gained its own concurrent read loop that prints any
+  server-pushed message (currently just stop-request alerts) as it arrives,
+  alongside its existing position-update write loop — demonstrates the new
+  push channel without needing a browser.
+- Tests:
+  - `backend/internal/stops/match_test.go` — pure unit tests, no DB, no WS:
+    `StopSequenceIndex` on/off-route; `FindApproachingDriver` matches an
+    approaching driver, rejects a driver whose nearest stop is past the
+    requested one, picks the nearer of two qualifying drivers, returns no
+    match when every driver has passed the stop (or none are online), and
+    returns no match when the requested stop isn't on the route at all.
+  - `backend/internal/stops/integration_test.go` — against a real Postgres
+    (skips if unreachable, same pattern as every prior stage) and a real
+    `/ws/driver` WebSocket connection (so alert delivery is proven through
+    the actual `DriverAlertHub`, not mocked): seeds a straight 3-stop,
+    2-leg route (Origin → Mid → Dest) plus a driver/vehicle/commuter,
+    drives `telemetry.GoOnline`/`UpdatePosition` directly (equivalent to
+    what a real `/ws/driver` connect + position update would do) alongside
+    an actual driver WS dial so the alert has somewhere real to land:
+    - `TestApproachingDriverReceivesAlert` — a driver near Origin requesting
+      pickup at Dest receives the `stop_request` alert on their own
+      connection, with matching `request_id`/`stop_id`.
+    - `TestDriverPastStopNotAlerted` — a driver whose nearest stop is Dest
+      does not get alerted for a Mid-stop request (clean `unmatched`
+      result).
+    - `TestDriverOnDifferentRouteNotAlerted` — a driver online on a
+      different route entirely is never considered.
+    - `TestNoDriverOnline_CleanUnmatchedResult` — no driver online at all on
+      the route → 200 `{status: "unmatched", driver_available: false}`, not
+      an error.
+    - `TestAckFlow_MarksRequestAcknowledged` — the matched driver acking the
+      request gets back `{status: "acknowledged"}`.
+
+Decisions / deviations from the original plan:
+- **Position-to-route-progress is "nearest stop by straight-line distance,"**
+  not true map-matching/geofencing — explicitly called out in `match.go`'s
+  doc comment and above, per the stage brief's required scope honesty. This
+  is the one approximation the whole feature rests on; everything else
+  (sequence indexing, driver selection) is exact given that approximation.
+- **Only the single nearest qualifying driver is alerted**, not every
+  qualifying driver — the brief left this as an open call. Chose the
+  simplest behavior for a first cut; broadening to multiple recipients
+  would only need a loop change in `RequestStop`, not a `match.go` rewrite.
+- **`/ws/driver`'s read loop moved onto its own goroutine** rather than
+  bolting a second connection or a separate long-poll endpoint onto the
+  driver client — this was the direct consequence of the brief's
+  requirement that the *existing* driver connection be able to receive
+  server-pushed alerts, and keeps the "one WS connection per driver" model
+  intact instead of adding a second channel.
+- **Commuter ack-notification was intentionally left out** (see above) —
+  the brief explicitly allowed this ("optionally"), and there's no existing
+  per-commuter live channel to hang it off of without adding new scope.
+- **Active stop-requests are in-memory (`stops.Store`) and reset on
+  restart** — explicitly called out in the brief as acceptable, matching
+  Stage 4's `VehicleStateStore` precedent exactly.
+
+Verified: `go build ./...`, `go vet ./...`, `gofmt -l .`, and `go mod tidy`
+all clean (no `go.mod`/`go.sum` changes — stops needed no new dependencies).
+Full test suite (`go test ./...`), including the new stops unit + WS
+integration tests, passes against a live Postgres, and `go test -race ./...`
+(MSYS2 `ucrt64` gcc toolchain, same as Stage 4/5) passes cleanly across
+every package with **no data races detected** — including the new
+`DriverAlertHub` under concurrent `Send`/`Subscribe`/`Unsubscribe` exercised
+by the WS integration tests running alongside each other. End-to-end
+verified by hand: seeded, started the server, brought a driver online near
+a route's origin stop via `cmd/wsdriver`, fired `POST /stops/request` for a
+downstream stop as a commuter and watched the alert print in the driver
+client's terminal in real time; confirmed a driver already past the
+requested stop, and a driver online on a different route, both correctly
+receive nothing and the request reports `driver_available: false`. See the
+PowerShell walkthrough below.
+
+Next: Stage 7 — fuel disbursement (mock)

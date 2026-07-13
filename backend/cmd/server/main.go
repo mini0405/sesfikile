@@ -16,6 +16,7 @@ import (
 	"sesfikile/backend/internal/identity"
 	"sesfikile/backend/internal/routing"
 	"sesfikile/backend/internal/server"
+	"sesfikile/backend/internal/stops"
 	"sesfikile/backend/internal/telemetry"
 	"sesfikile/backend/internal/wallet"
 )
@@ -55,12 +56,16 @@ func main() {
 
 	telemetryStore := telemetry.NewVehicleStateStore()
 	telemetryHub := telemetry.NewHub()
-	telemetryHandlers := telemetry.NewHandlers(telemetryStore, telemetryHub, identityRepo, routingRepo, tokens)
+	driverAlerts := telemetry.NewDriverAlertHub()
+	telemetryHandlers := telemetry.NewHandlers(telemetryStore, telemetryHub, driverAlerts, identityRepo, routingRepo, tokens)
 
 	boardingSigner := boarding.NewSigner(cfg.BoardingHMACSecret)
 	boardingHandlers := boarding.NewHandlers(routingRepo, walletRepo, identityRepo, telemetryStore, telemetryHub, boardingSigner, cfg.BoardingPassTTL, cfg.FareSplit)
 
-	router := server.NewRouter(database, identityHandlers, tokens, walletHandlers, routingHandlers, telemetryHandlers, boardingHandlers)
+	stopsStore := stops.NewStore()
+	stopsHandlers := stops.NewHandlers(stopsStore, routingRepo, telemetryStore, driverAlerts, identityRepo)
+
+	router := server.NewRouter(database, identityHandlers, tokens, walletHandlers, routingHandlers, telemetryHandlers, boardingHandlers, stopsHandlers)
 
 	httpServer := &http.Server{
 		Addr:    ":" + cfg.Port,

@@ -15,6 +15,7 @@ import (
 	"sesfikile/backend/internal/config"
 	"sesfikile/backend/internal/identity"
 	"sesfikile/backend/internal/routing"
+	"sesfikile/backend/internal/stops"
 	"sesfikile/backend/internal/telemetry"
 	"sesfikile/backend/internal/wallet"
 )
@@ -36,9 +37,11 @@ func testRouter(pinger Pinger) chi.Router {
 	routingRepo := routing.NewRepo(nil)
 	telemetryStore := telemetry.NewVehicleStateStore()
 	telemetryHub := telemetry.NewHub()
-	telemetryHandlers := telemetry.NewHandlers(telemetryStore, telemetryHub, identityRepo, routingRepo, tokens)
+	driverAlerts := telemetry.NewDriverAlertHub()
+	telemetryHandlers := telemetry.NewHandlers(telemetryStore, telemetryHub, driverAlerts, identityRepo, routingRepo, tokens)
 	boardingHandlers := boarding.NewHandlers(routingRepo, wallet.NewRepo(nil), identityRepo, telemetryStore, telemetryHub, boarding.NewSigner("test-boarding-secret"), 3*time.Minute, config.FareSplit{PlatformPct: 10, DriverPct: 25, OwnerPct: 65})
-	return NewRouter(pinger, handlers, tokens, walletHandlers, routingHandlers, telemetryHandlers, boardingHandlers)
+	stopsHandlers := stops.NewHandlers(stops.NewStore(), routingRepo, telemetryStore, driverAlerts, identityRepo)
+	return NewRouter(pinger, handlers, tokens, walletHandlers, routingHandlers, telemetryHandlers, boardingHandlers, stopsHandlers)
 }
 
 func TestHealthHandler_Healthy(t *testing.T) {

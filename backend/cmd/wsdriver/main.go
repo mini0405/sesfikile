@@ -10,6 +10,10 @@
 // Once connected it streams small simulated position deltas every 2s, and
 // applies one seat delta at startup if -seats is set. Ctrl+C to disconnect
 // (the server marks the vehicle offline the moment this process exits).
+//
+// Stage 6: /ws/driver is now bidirectional — this client also reads frames
+// concurrently and prints any server-pushed stop-request alert as it
+// arrives.
 package main
 
 import (
@@ -56,6 +60,20 @@ func main() {
 	}
 	defer conn.Close()
 	log.Printf("connected as driver, online on route %s", *routeID)
+
+	// Read loop: prints any server-pushed message (currently just Stage 6's
+	// stop-request alerts) as it arrives. Runs concurrently with the write
+	// loop below, satisfying gorilla/websocket's one-reader/one-writer rule.
+	go func() {
+		for {
+			var msg map[string]any
+			if err := conn.ReadJSON(&msg); err != nil {
+				return // connection closed
+			}
+			b, _ := json.Marshal(msg)
+			log.Printf("ALERT received: %s", b)
+		}
+	}()
 
 	if *seatsDelta != 0 {
 		if err := conn.WriteJSON(map[string]any{"seats_delta": *seatsDelta}); err != nil {

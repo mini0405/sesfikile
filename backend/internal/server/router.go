@@ -7,11 +7,12 @@ import (
 	"sesfikile/backend/internal/boarding"
 	"sesfikile/backend/internal/identity"
 	"sesfikile/backend/internal/routing"
+	"sesfikile/backend/internal/stops"
 	"sesfikile/backend/internal/telemetry"
 	"sesfikile/backend/internal/wallet"
 )
 
-func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identity.TokenIssuer, walletHandlers *wallet.Handlers, routingHandlers *routing.Handlers, telemetryHandlers *telemetry.Handlers, boardingHandlers *boarding.Handlers) chi.Router {
+func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identity.TokenIssuer, walletHandlers *wallet.Handlers, routingHandlers *routing.Handlers, telemetryHandlers *telemetry.Handlers, boardingHandlers *boarding.Handlers, stopsHandlers *stops.Handlers) chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -43,6 +44,7 @@ func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identi
 			r.Use(identity.RequireRole(identity.RoleCommuter))
 			r.Post("/wallet/topup", walletHandlers.Topup)
 			r.Post("/boarding/pass", boardingHandlers.IssuePass)
+			r.Post("/stops/request", stopsHandlers.RequestStop)
 		})
 
 		r.Group(func(r chi.Router) {
@@ -50,6 +52,7 @@ func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identi
 			r.Post("/fare/charge", walletHandlers.ChargeFare)
 			r.Post("/telemetry/seats", telemetryHandlers.UpdateSeats)
 			r.Post("/boarding/scan", boardingHandlers.ScanPass)
+			r.Post("/stops/request/{id}/ack", stopsHandlers.AckRequest)
 		})
 	})
 
