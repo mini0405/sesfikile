@@ -126,6 +126,22 @@ func (r *Repo) GetVehicleByRegistration(ctx context.Context, registration string
 	return v, nil
 }
 
+func (r *Repo) GetVehicleByID(ctx context.Context, id uuid.UUID) (Vehicle, error) {
+	var v Vehicle
+	err := r.pool.QueryRow(ctx,
+		`SELECT id, owner_user_id, registration, capacity, association_name, compliance_status, created_at, updated_at
+		 FROM vehicles WHERE id = $1`,
+		id,
+	).Scan(&v.ID, &v.OwnerUserID, &v.Registration, &v.Capacity, &v.AssociationName, &v.ComplianceStatus, &v.CreatedAt, &v.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Vehicle{}, ErrNotFound
+		}
+		return Vehicle{}, err
+	}
+	return v, nil
+}
+
 func (r *Repo) CreateVehicle(ctx context.Context, ownerUserID uuid.UUID, registration string, capacity int, associationName *string) (Vehicle, error) {
 	var v Vehicle
 	err := r.pool.QueryRow(ctx,
@@ -141,6 +157,25 @@ func (r *Repo) CreateVehicle(ctx context.Context, ownerUserID uuid.UUID, registr
 		return Vehicle{}, err
 	}
 	return v, nil
+}
+
+// GetActiveVehicleAssignmentByDriverID returns the driver's current active
+// vehicle assignment. There is at most one, enforced by the partial unique
+// index on vehicle_assignments (driver_id WHERE active).
+func (r *Repo) GetActiveVehicleAssignmentByDriverID(ctx context.Context, driverID uuid.UUID) (VehicleAssignment, error) {
+	var a VehicleAssignment
+	err := r.pool.QueryRow(ctx,
+		`SELECT id, vehicle_id, driver_id, active, created_at, updated_at
+		 FROM vehicle_assignments WHERE driver_id = $1 AND active = true`,
+		driverID,
+	).Scan(&a.ID, &a.VehicleID, &a.DriverID, &a.Active, &a.CreatedAt, &a.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return VehicleAssignment{}, ErrNotFound
+		}
+		return VehicleAssignment{}, err
+	}
+	return a, nil
 }
 
 func (r *Repo) CreateVehicleAssignment(ctx context.Context, vehicleID, driverID uuid.UUID) (VehicleAssignment, error) {

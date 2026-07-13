@@ -15,6 +15,7 @@ import (
 	"sesfikile/backend/internal/identity"
 	"sesfikile/backend/internal/routing"
 	"sesfikile/backend/internal/server"
+	"sesfikile/backend/internal/telemetry"
 	"sesfikile/backend/internal/wallet"
 )
 
@@ -51,7 +52,11 @@ func main() {
 	routingRepo := routing.NewRepo(database.Pool)
 	routingHandlers := routing.NewHandlers(routingRepo)
 
-	router := server.NewRouter(database, identityHandlers, tokens, walletHandlers, routingHandlers)
+	telemetryStore := telemetry.NewVehicleStateStore()
+	telemetryHub := telemetry.NewHub()
+	telemetryHandlers := telemetry.NewHandlers(telemetryStore, telemetryHub, identityRepo, routingRepo, tokens)
+
+	router := server.NewRouter(database, identityHandlers, tokens, walletHandlers, routingHandlers, telemetryHandlers)
 
 	httpServer := &http.Server{
 		Addr:    ":" + cfg.Port,
