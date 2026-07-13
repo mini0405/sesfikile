@@ -58,6 +58,20 @@ func directSegment(r RouteWithLegs, origin, dest uuid.UUID) (Segment, bool) {
 	return Segment{RouteID: r.Route.ID, RouteName: r.Route.Name, Legs: legs, FareCents: fare}, true
 }
 
+// FareForSegment computes the fare for a single ride along legs (one
+// route's ordered legs) from fromStopID to toStopID, in increasing sequence
+// order — the same direct-ride rule Search uses for a single route. Used by
+// boarding (Stage 5) to price a pass against one specific route rather than
+// searching across all routes. ok=false if the stops aren't both on this
+// route with fromStopID reachable before toStopID.
+func FareForSegment(legs []RouteLeg, fromStopID, toStopID uuid.UUID) (fareCents int64, ok bool) {
+	seg, ok := directSegment(RouteWithLegs{Legs: legs}, fromStopID, toStopID)
+	if !ok {
+		return 0, false
+	}
+	return seg.FareCents, true
+}
+
 // Search finds the best path from origin to dest across the given routes.
 // Ordering: fewest transfers first (a direct ride always beats any
 // transfer), then lowest total fare. The MVP supports at most one transfer

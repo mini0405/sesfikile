@@ -531,3 +531,202 @@ the same live state over plain REST, and confirmed killing `cmd/wsdriver`
 (`offline` event) and the REST snapshot.
 
 Next: Stage 5 — boarding (QR scan)
+
+---
+
+## Stage 5 — boarding (fare-on-scan) — DONE (2026-07-14)
+
+Built:
+- `backend/internal/boarding/` — the boarding module. **Fuses, not
+  reimplements**: identity/JWT (Stage 1) via `identity.RequireAuth`/
+  `RequireRole` at the router, the wallet ledger's `ChargeFare` (Stage 2)
+  called directly for the actual charge, routing's route/leg data (Stage 3)
+  for pricing, and the telemetry `VehicleStateStore`/`Hub` (Stage 4) for the
+  online/assignment check and seat decrement + broadcast. No new ledger
+  path, no duplicated driver/vehicle lookups.
+  - `models.go` — `PassPayload{CommuterID, RouteID, FromStopID, ToStopID,
+    FareCents, IssuedAt, ExpiresAt, Nonce}`. `FareCents` is resolved once at
+    issue time and carried *inside* the signed payload, so a scan never has
+    to (and can't be tricked into) re-deriving or trusting a different fare.
+    `Nonce` (a UUID) is the unique per-pass identifier.
+  - `token.go` — `Signer`, a minimal self-contained HMAC-SHA256 scheme built
+    directly on `crypto/hmac`/`crypto/sha256` rather than a JWT library: the
+    token is `base64url(JSON payload) + "." + base64url(HMAC-SHA256 over the
+    payload segment)`. Chosen over reusing `golang-jwt` because a boarding
+    pass has a different trust boundary and lifecycle than an auth JWT (very
+    short TTL, signed by a *different* secret than login tokens, and no
+    claims/registered-claims baggage needed) — sharing the JWT library would
+    have been convenient but would blur "this proves who you are" (Stage 1)
+    with "this proves what you're allowed to board" (Stage 5). `Verify` uses
+    `hmac.Equal` (constant-time) and returns a distinct error for a
+    malformed token vs. a bad signature; it does **not** check expiry itself
+    — that's a separate, distinctly-reported check in `ScanPass`, per the
+    stage brief's "each failing cleanly with a distinct status/error."
+  - `handlers.go` — `Handlers.IssuePass` (`POST /boarding/pass`, commuter
+    only) and `Handlers.ScanPass` (`POST /boarding/scan`, driver only).
+- `backend/internal/routing/graph.go` — added `FareForSegment(legs,
+  fromStopID, toStopID) (fareCents int64, ok bool)`, a thin exported wrapper
+  around the existing unexported `directSegment` helper `Search` already
+  uses. This is the one new helper boarding needed from Stage 3: pricing a
+  pass is "the direct fare on *this one* route between two stops," not a
+  cross-route search, so it reuses `directSegment`'s same increasing-
+  sequence rule rather than calling `Search` (which searches across all
+  routes and would happily return a cheaper path on a *different* route than
+  the one on the pass).
+- `backend/internal/telemetry/view.go` — added `ToView(VehicleState)
+  VehicleView`, the exported form of the already-existing unexported
+  `toView`, so boarding can build the same WS broadcast payload as telemetry
+  itself after decrementing seats, without duplicating the projection.
+- **No changes to Stage 2's `/fare/charge` or `ChargeFare` signature** — the
+  boarding brief allowed adjusting it if needed, but `ChargeFare(ctx,
+  commuterUserID, vehicleID, fareCents, idempotencyKey, platformPct,
+  driverPct)` already accepted everything boarding needed. `ScanPass` calls
+  it with the pass's `Nonce` as `idempotencyKey`, and all of Stage 2's
+  original tests keep passing unchanged.
+- `POST /boarding/pass` (commuter, behind `RequireAuth` + `RequireRole`):
+  `{route_id, from_stop_id, to_stop_id}` → looks up the route (404 if
+  missing), loads its legs, prices via `routing.FareForSegment` (404 "no
+  valid path" if the stops aren't in order on that route), builds and signs
+  a `PassPayload` with `ExpiresAt = now + config.BoardingPassTTL`. Returns
+  `{pass_token, expires_at, fare_cents}`.
+- `POST /boarding/scan` (driver, behind `RequireAuth` + `RequireRole`):
+  `{pass_token}` →, **in this exact order**:
+  1. **Signature.** `Signer.Verify` (constant-time). Malformed or
+     tampered → 401 `"invalid or tampered pass"`. No charge, no seat change.
+  2. **Expiry.** `PassPayload.Expired(now)`. Expired → 410 `"pass has
+     expired"`. No charge, no seat change.
+  3. **Driver/vehicle/route match.** Resolves the caller's driver profile
+     (Stage 1) and active vehicle assignment (Stage 1), then checks the
+     telemetry store (Stage 4): the vehicle must be present (online) and its
+     tracked `RouteID` must equal the pass's `RouteID`. Any mismatch
+     (no driver profile, no active assignment, vehicle offline, or online on
+     a *different* route) → 409 `"driver is not online on this pass's
+     route"`. No charge, no seat change.
+  4. **Charge.** `wallet.Repo.ChargeFare(ctx, payload.CommuterID,
+     assignment.VehicleID, payload.FareCents, payload.Nonce, ...)` — the
+     pass's nonce *is* the ledger idempotency key. 402 on insufficient
+     funds (no seat change), 422 if the vehicle unexpectedly has no active
+     driver row (defensive — should already be excluded by step 3).
+  5. **Seat decrement, tied to freshness not to the scan itself.** Only when
+     `ChargeFare` returns `replayed=false` does `ScanPass` call
+     `telemetry.AdjustSeats(vehicleID, -1)` and publish the update over the
+     hub. A replayed scan reports the *current* `seats_remaining` from the
+     store without touching it — this is what makes a double-scan of the
+     same pass debit the wallet exactly once **and** decrement seats exactly
+     once, using the *same* freshness signal for both, rather than two
+     independently-idempotent-but-possibly-inconsistent checks.
+  Returns `{transaction_id, fare_cents, platform_cents, driver_cents,
+  owner_cents, seats_remaining, replayed}` — 201 on a fresh charge, 200 on a
+  replay.
+- `backend/internal/config` — added `BoardingHMACSecret` (env
+  `BOARDING_HMAC_SECRET`, dev-only default, documented in `.env.example` —
+  deliberately a **different** secret from `JWT_SECRET`, since a leaked
+  boarding secret and a leaked auth secret are different blast radii) and
+  `BoardingPassTTL` (env `BOARDING_PASS_TTL_SECONDS`, default **180s**, i.e.
+  3 minutes — within the brief's suggested 2-5 min window).
+- `backend/internal/server/router.go`, `backend/cmd/server/main.go` — wired
+  `boarding.NewHandlers` alongside the existing modules; `NewRouter` gained a
+  `boardingHandlers` parameter (`health_test.go` updated to match, same
+  pattern as every prior stage).
+- Tests:
+  - `backend/internal/boarding/token_test.go` — pure unit tests, no DB:
+    sign→verify round-trips the payload; verify rejects a token signed with
+    a different secret; verify rejects a tampered payload byte; verify
+    rejects a tampered signature byte (flipped in the *middle* of the
+    signature segment, not the last character — a base64url encoding's
+    final character can carry unused padding bits that don't change the
+    decoded byte value, which would make a last-byte flip a false-negative
+    tamper test); verify rejects assorted malformed token shapes;
+    `PassPayload.Expired` at/before/after the boundary.
+  - `backend/internal/boarding/boarding_test.go` — against a real Postgres
+    (skips if unreachable, same pattern as every prior stage) and the real
+    HTTP handlers (via `chi.Router` + `identity.RequireAuth`, driven with
+    real bearer tokens — "test it as a raw token over HTTP" per the brief).
+    `seedFixture` creates a route+leg, an owner/vehicle/driver with an
+    active assignment, and a commuter, then marks the vehicle online on the
+    route directly in the `VehicleStateStore` (equivalent to what a real
+    `/ws/driver` connection does, without needing a live WS connection in
+    every test):
+    - `TestHappyPath_IssueScanChargeSeatDecrement` — issue → scan: ledger
+      charged (split sums to the fare), commuter balance debited by exactly
+      the fare, seats decremented by exactly 1, receipt fields correct.
+    - `TestTamperedPass_Rejected` — flipped signature byte → 401, no charge,
+      no seat change.
+    - `TestExpiredPass_Rejected` — a pass issued through a handler wired
+      with a 1-nanosecond TTL (deterministic, no real-time sleep-then-race)
+      → 410 once past that TTL, no charge, no seat change.
+    - `TestDoubleScan_IdempotentReplay` — same pass scanned twice → same
+      `transaction_id`, second response `replayed:true`, wallet debited
+      exactly once, seats decremented exactly once (verified both via the
+      store directly and via the replay's own reported `seats_remaining`).
+    - `TestInsufficientFundsRejected` — commuter balance below the fare →
+      402, wallet unchanged, no seat change.
+    - `TestWrongDriverRoute_Rejected` — a second, *online* driver on a
+      *different* route scans the first pass → 409, no charge, no seat
+      change.
+    - `TestDriverOffline_Rejected` — the assigned driver's vehicle is taken
+      offline in the store (as a closed `/ws/driver` connection would do)
+      before scanning → 409.
+
+Decisions / deviations from the original plan:
+- **A boarding pass prices against one specific route** (`FareForSegment`
+  over that route's legs), not a cross-route `routing.Search`. The pass
+  payload already carries a `route_id` the commuter chose (e.g. from a
+  `/routes/search` result they're about to board), so re-running a general
+  search at issue time could silently substitute a cheaper *different*
+  route than the one the commuter is standing at — `FareForSegment` prices
+  exactly the ride the pass claims to be for.
+- **Own HMAC scheme instead of reusing `golang-jwt`** (already used for auth
+  in Stage 1). A hand-rolled `base64url(payload).base64url(hmac)` format was
+  simpler to reason about for a short-lived, single-purpose, QR-sized token,
+  keeps the boarding trust boundary (a different secret, a much shorter
+  TTL) visibly separate from the auth trust boundary in the code, and avoids
+  JWT registered-claims fields that don't apply here. `hmac.Equal` still
+  gives the constant-time comparison the brief explicitly asks for.
+- **Expiry is checked separately from signature verification**, not folded
+  into `Verify`, so a scan can distinguish "this pass was forged/corrupted"
+  (401) from "this pass was real but is too old" (410) — both were called
+  out as needing distinct statuses in the brief.
+- **The seat decrement's freshness check reuses `ChargeFare`'s own
+  `replayed` return value** rather than a second, independent idempotency
+  mechanism (e.g. tracking scanned nonces in telemetry). This guarantees the
+  wallet debit and the seat decrement can never disagree about whether a
+  given scan was "the first" one — they're both gated on the same boolean
+  from the same ledger call.
+- **The driver/route match check reuses the live telemetry store, not just
+  the Stage 1 `vehicle_assignments` row.** A driver can be correctly
+  assigned to a vehicle in Stage 1's data yet not actually be online (no
+  live `/ws/driver` connection) or online on a *different* route than the
+  one on the pass — `ScanPass` requires all three (assigned, online, online
+  on *this* route) to match, which is what `TestDriverOffline_Rejected` and
+  `TestWrongDriverRoute_Rejected` cover.
+- Kept `BOARDING_HMAC_SECRET` **distinct** from `JWT_SECRET` even though
+  both are dev-only defaults today — a real deployment rotating one
+  shouldn't have to reason about the other, and a leak of one has a
+  different blast radius (forge boarding passes vs. forge full auth
+  sessions) than the other.
+
+SCOPE HONESTY (per CLAUDE.md and the stage brief): this stage produces and
+verifies the signed pass token a QR code would carry — there is no QR
+rendering/scanning yet (a later frontend stage) — and proves the
+cryptographic + financial flow only. It does not add proximity/geofencing;
+boarding still assumes the commuter physically handed their phone to (or was
+scanned by) the driver.
+
+Verified: `go build ./...`, `go vet ./...`, `gofmt -l .`, and `go mod tidy`
+all clean (no `go.mod`/`go.sum` changes — boarding needed no new
+dependencies). Full test suite (`go test ./...`), including the new
+boarding unit + integration tests, passes against a live Postgres, and `go
+test -race ./...` passes cleanly across every package (MSYS2 `ucrt64` gcc
+toolchain, same as Stage 4) with **no data races detected** and no
+regressions in Stage 2's original wallet/ledger tests. End-to-end verified
+by hand: seeded, started the server, logged in as a seeded commuter and
+driver, ran `cmd/wsdriver` to bring driver 1's vehicle online on "Cape Town
+CBD - Bellville", `POST /boarding/pass` for the full Cape Town Station →
+Bellville Station ride (fare 1100 = 700 + 400), `POST /boarding/scan` →
+fresh charge (`replayed:false`, split 110/275/715, `seats_remaining: 15`,
+seats 16→15 confirmed via `GET /telemetry/vehicles`), then scanned the
+*same* pass again → identical `transaction_id`, `replayed:true`,
+`seats_remaining` still 15 (no double charge, no double decrement).
+
+Next: Stage 6 — request-a-stop

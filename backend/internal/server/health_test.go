@@ -7,9 +7,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
+	"sesfikile/backend/internal/boarding"
 	"sesfikile/backend/internal/config"
 	"sesfikile/backend/internal/identity"
 	"sesfikile/backend/internal/routing"
@@ -32,8 +34,11 @@ func testRouter(pinger Pinger) chi.Router {
 	routingHandlers := routing.NewHandlers(routing.NewRepo(nil))
 	identityRepo := identity.NewRepo(nil)
 	routingRepo := routing.NewRepo(nil)
-	telemetryHandlers := telemetry.NewHandlers(telemetry.NewVehicleStateStore(), telemetry.NewHub(), identityRepo, routingRepo, tokens)
-	return NewRouter(pinger, handlers, tokens, walletHandlers, routingHandlers, telemetryHandlers)
+	telemetryStore := telemetry.NewVehicleStateStore()
+	telemetryHub := telemetry.NewHub()
+	telemetryHandlers := telemetry.NewHandlers(telemetryStore, telemetryHub, identityRepo, routingRepo, tokens)
+	boardingHandlers := boarding.NewHandlers(routingRepo, wallet.NewRepo(nil), identityRepo, telemetryStore, telemetryHub, boarding.NewSigner("test-boarding-secret"), 3*time.Minute, config.FareSplit{PlatformPct: 10, DriverPct: 25, OwnerPct: 65})
+	return NewRouter(pinger, handlers, tokens, walletHandlers, routingHandlers, telemetryHandlers, boardingHandlers)
 }
 
 func TestHealthHandler_Healthy(t *testing.T) {

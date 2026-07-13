@@ -12,6 +12,13 @@ type VehicleView struct {
 	LastUpdated    string  `json:"last_updated"`
 }
 
+// ToView is the exported form of toView, for callers outside this package
+// (e.g. boarding's seat-decrement publish) that need to build a VehicleView
+// from a VehicleState without duplicating the projection logic.
+func ToView(s VehicleState) VehicleView {
+	return toView(s)
+}
+
 func toView(s VehicleState) VehicleView {
 	return VehicleView{
 		VehicleID:      s.VehicleID.String(),

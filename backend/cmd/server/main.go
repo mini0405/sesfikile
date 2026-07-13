@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"sesfikile/backend/internal/boarding"
 	"sesfikile/backend/internal/config"
 	"sesfikile/backend/internal/db"
 	"sesfikile/backend/internal/identity"
@@ -56,7 +57,10 @@ func main() {
 	telemetryHub := telemetry.NewHub()
 	telemetryHandlers := telemetry.NewHandlers(telemetryStore, telemetryHub, identityRepo, routingRepo, tokens)
 
-	router := server.NewRouter(database, identityHandlers, tokens, walletHandlers, routingHandlers, telemetryHandlers)
+	boardingSigner := boarding.NewSigner(cfg.BoardingHMACSecret)
+	boardingHandlers := boarding.NewHandlers(routingRepo, walletRepo, identityRepo, telemetryStore, telemetryHub, boardingSigner, cfg.BoardingPassTTL, cfg.FareSplit)
+
+	router := server.NewRouter(database, identityHandlers, tokens, walletHandlers, routingHandlers, telemetryHandlers, boardingHandlers)
 
 	httpServer := &http.Server{
 		Addr:    ":" + cfg.Port,
