@@ -1453,3 +1453,159 @@ Invoke-RestMethod -Method Get http://localhost:8080/owner/ledger `
 ```
 
 Next: Stage 9 — frontends (commuter, driver, owner apps)
+
+---
+
+## Stage 9a — driver app — DONE (2026-07-14)
+
+Frontend only — no backend logic changes. Built entirely on Stages 1-8's
+existing REST/WS surface; the one backend touch was adding dev CORS (see
+below), which every later frontend stage (9b commuter, 9c owner) will also
+rely on.
+
+**Stack**: Vite + React 18 + TypeScript (strict), Tailwind CSS, `html5-qrcode`
+for camera QR scanning. No state library beyond React hooks + one
+`AuthContext` — the app is small enough that Redux/Zustand/etc. would be pure
+overhead, not a real need.
+
+Built:
+- `apps/driver/` — a self-contained workspace (own `package.json`,
+  `vite.config.ts`, `tsconfig.json`, Tailwind/PostCSS config). Dev server on
+  port **5174** (the backend already owns 8080). `VITE_API_BASE_URL` (default
+  `http://localhost:8080`) in `.env`/`.env.example` — Vite only exposes
+  `VITE_`-prefixed vars to client code.
+- `src/api/client.ts` — a small typed `fetch` wrapper (`request<T>`), one
+  `ApiError` class carrying the HTTP status + the backend's `{"error": "..."}`
+  message, a module-level `authToken` set by `AuthContext` on login/logout
+  (simpler than threading the token through every call site), and
+  `wsBaseUrl()` (swaps `http`→`ws` on the same configured base URL) since
+  `/ws/driver` lives on the same origin/port as the REST API.
+- `src/types.ts` — wire types hand-mirrored from the backend's actual JSON
+  responses (`internal/*/handlers.go`) — there's no OpenAPI/codegen in this
+  repo yet, so these are kept 1:1 with the Go response structs by hand.
+- `src/context/AuthContext.tsx` — login (`POST /auth/login`, rejects a
+  non-driver role client-side before ever showing the dashboard), logout,
+  token persistence. **Token storage: `sessionStorage`, not `localStorage`**
+  — still plaintext-JS-readable (no hardened secure-storage exists in a
+  browser), but at least clears on tab close rather than persisting
+  indefinitely; documented as a deliberate middle ground for a dev MVP with
+  no refresh-token flow, not a hardened choice, per the brief's explicit
+  instruction not to use `localStorage` for anything security-sensitive.
+- `src/hooks/useGeolocation.ts` — wraps `navigator.geolocation.watchPosition`
+  behind an `enabled` flag; reports a distinct status per outcome (`watching`
+  / `denied` / `unsupported` / `error`) rather than a single boolean, so the
+  UI can show *why* location isn't flowing, not just that it isn't. Doc
+  comment flags the secure-context requirement (below).
+- `src/hooks/useDriverSocket.ts` — owns the single bidirectional `/ws/driver`
+  connection for the session: sends `{lat,lng}` / seat messages, receives
+  pushed `stop_request` alerts. **Reconnects with backoff** (1s/2s/5s/8s)
+  while the driver is still toggled online, rather than silently going dark
+  on a dropped connection — exposes a `status` (`connecting` /
+  `open` / `reconnecting` / `closed`) the dashboard renders directly. The
+  JWT is passed as a `?token=` query param (per `telemetry.bearerToken`'s
+  documented fallback — browsers' `WebSocket` constructor cannot set custom
+  handshake headers).
+- Screens (`src/screens/`), wired together by `src/DriverApp.tsx` (all
+  cross-screen state — routes, socket, geolocation, seats, alerts — lives
+  here; screens are presentational, given props):
+  1. **Login** — phone + password, clean error display on bad credentials.
+  2. **Dashboard (Home)** — route picker (`GET /routes`) → selecting a route
+     immediately opens `/ws/driver` and starts streaming position (no
+     separate "confirm" step, matching Stage 4's "going online means online
+     on a route" model). Shows connection status and geolocation status as
+     pills, plus the last known lat/lng.
+  3. **Scan** — the hero action: camera QR scan (`html5-qrcode`,
+     `facingMode: "environment"`) or a manual paste-token fallback text area,
+     either path calling `POST /boarding/scan`. The receipt view visually
+     distinguishes a **fresh charge** (green, "Fare charged") from an
+     **idempotent replay** (amber, "Already charged (replay)" with an
+     explanation) — both cases the API can return, per Stage 5.
+  4. **Seats & earnings** — ± buttons call `POST /telemetry/seats` with
+     `{delta}`; on first connecting, a `{delta: 0}` no-op call is used purely
+     to *read* the vehicle's current seat state (there's no dedicated GET for
+     a driver's own vehicle). Earnings shows the `driver_earnings` balance
+     via `GET /wallet/balance` — **there is no driver-scoped trips/earnings
+     breakdown endpoint yet** (Stage 8's richer stats are owner-only, under
+     `/owner/*`), so this screen is balance-only; flagged in the README
+     rather than faked.
+  5. **Alerts** — lists `stop_request` messages pushed over the same
+     `/ws/driver` connection (Stage 6); acknowledging one calls
+     `POST /stops/request/{id}/ack` and removes it from the list. A badge
+     count on the bottom-nav tab surfaces unread alerts from any screen.
+- Bottom tab nav (`src/components/BottomNav.tsx`) — mobile-first, thumb-reach
+  navigation between the four screens; Tailwind throughout for a demo-ready
+  look rather than an unstyled wireframe.
+
+**Backend change (the only one this stage made)**:
+`backend/internal/server/router.go` gained a `devCORS` middleware — reflects
+the request's `Origin`, allows `GET/POST/PUT/PATCH/DELETE/OPTIONS`, allows
+the `Authorization`/`Content-Type` headers, and answers `OPTIONS` preflights
+with a bare 204. Explicitly commented as **dev-only, allow-all**: this MVP
+has no cloud/production deployment yet, so there's no real origin allowlist
+to enforce against; tightening this is flagged as needed before any
+non-local deployment. No other backend files changed.
+
+SCOPE HONESTY (per CLAUDE.md and the stage brief):
+- **Geolocation and camera both require a secure context** (`https://`, or
+  the browser's special-cased `http://localhost`). This app works as-is in
+  dev on a desktop browser at `http://localhost:5174`. It will **not** work
+  testing on a real phone over `http://<lan-ip>:5174` — most mobile browsers
+  silently deny both permissions over plain HTTP on a non-localhost host.
+  On-device testing needs an HTTPS tunnel or a real certificate, neither set
+  up here — called out in `apps/driver/README.md` as a known gap for a later
+  stage, not solved in this one.
+- The seat "peek" via `{delta: 0}` is a documented workaround for the lack of
+  a dedicated "my vehicle's current state" GET endpoint for drivers — not a
+  new backend capability, just reusing the existing seats endpoint's return
+  value.
+
+Verified: `go build ./...` (backend, after the CORS change), `npm install`,
+`npx tsc --noEmit`, and `npm run build` (frontend) all pass cleanly. Ran
+Postgres + `cmd/server` + `npm run dev` together and confirmed: the Vite dev
+server serves `http://localhost:5174`, and a cross-origin `OPTIONS`/
+`POST /auth/login` sent with `Origin: http://localhost:5174` against the
+live backend succeeds with the new CORS headers and returns a real driver
+JWT (seeded driver `+27820000002` / `Driver123!`) — proving the frontend can
+actually reach the backend cross-origin.
+
+### Design revisit (2026-07-14) — applied the `frontend-design` skill
+
+The first pass (above) was functionally complete but visually generic —
+dark-slate background with a single emerald accent, one of the
+skill-documented default "AI-generated" looks. Redid the whole visual layer
+(no logic/data-flow changes) around one concrete subject: the hand-lettered
+destination board a real minibus taxi driver tapes to the windscreen.
+
+- New token system in `tailwind.config.js`: `board`/`ink` (destination-board
+  cream + marker lettering), `rank` (rank/curb-paint yellow, primary action),
+  `taxi` (livery blue), `brake` (brake-light red, alerts/replays only), `tar`
+  (warm near-black backdrop, not cool slate). No webfont fetch — display
+  lettering uses a heavy system sans at large scale/tight tracking rather
+  than an exotic typeface, keeping the app dependency-free/offline-friendly.
+- Signature components in `src/index.css` (`@layer components`): `.board`
+  (the destination-board card — reused for login, the route/status header,
+  and the earnings readout), `.ticket`/`.stamp` (the boarding-scan receipt:
+  a torn till-slip with a rotated rubber-stamp verdict — taxi-blue "Paid" for
+  a fresh charge, brake-red "Already Paid" for an idempotent replay — a
+  direct visual answer to the one thing that screen has to communicate),
+  `.led` (dashboard instrument-light status indicators, replacing soft pill
+  badges).
+- Every screen (`Login`, `Dashboard`, `Scan`, `Seats`, `Alerts`) and both
+  shared components (`StatusPill`, `BottomNav`) restyled to the new system;
+  `SeatsScreen` gained a seat grid (one square per physical seat, filled vs.
+  dim) instead of a bare fraction.
+- Full design rationale documented in `apps/driver/README.md`'s new "Design
+  direction" section.
+
+Verified visually, not just by build: installed `playwright` in the scratch
+dir (pointed at the machine's already-cached Chromium, since a fresh
+`playwright install` wasn't available) and drove the real running app —
+login, route selection going online, all four tabs, and a full boarding-pass
+issue → scan → receipt → replay-scan round trip against the live backend (as
+a real seeded commuter + driver) — capturing a screenshot at every step to
+self-critique against the skill's process instead of eyeballing rendered
+JSX. Confirmed the fresh-charge vs. replay stamp distinction renders correctly and
+the destination-board motif holds up across the online/offline states.
+`npx tsc --noEmit` and `npm run build` re-verified clean after the restyle.
+
+Next: Stage 9b — commuter app

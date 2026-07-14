@@ -1,6 +1,8 @@
 package server
 
 import (
+	"net/http"
+
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
@@ -18,6 +20,12 @@ func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identi
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
+	// Dev-only permissive CORS: the Stage 9a driver web app (Vite dev server,
+	// a different origin than this API) needs to call these endpoints from
+	// the browser. No cloud/production deployment exists yet for this MVP,
+	// so a wide-open allow-all is acceptable here; tighten this to a real
+	// allowlist before any non-local deployment.
+	r.Use(devCORS)
 
 	r.Get("/health", healthHandler(pinger))
 
@@ -80,4 +88,27 @@ func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identi
 	})
 
 	return r
+}
+
+// devCORS is a dev-only, allow-all CORS middleware (see the comment where
+// it's registered in NewRouter). It reflects the request's Origin rather
+// than a hardcoded "*" so it also works for requests that need credentials
+// mode, and handles the browser's OPTIONS preflight for the JSON POST
+// endpoints (/auth/login, /boarding/scan, etc.) that carry an Authorization
+// header and Content-Type: application/json.
+func devCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin := r.Header.Get("Origin"); origin != "" {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

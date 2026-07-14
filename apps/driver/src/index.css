@@ -1,0 +1,102 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+  background-color: theme("colors.tar.DEFAULT");
+}
+
+@layer components {
+  /* The windscreen destination board: the app's signature surface. Cream
+     cardstock, hard corners (not the soft rounded-2xl of generic app
+     chrome), a torn/taped top edge implied by the .tape corner chips. */
+  .board {
+    @apply relative rounded-sm border-2 border-ink bg-board text-ink shadow-board;
+  }
+
+  .tape {
+    @apply pointer-events-none absolute -top-2 h-4 w-10 rotate-[-3deg] bg-rank/80 shadow-tape;
+  }
+
+  .board-heading {
+    @apply font-display text-[11px] font-black uppercase tracking-[0.2em] text-ink/60;
+  }
+
+  .board-value {
+    @apply font-display text-3xl font-black uppercase leading-none tracking-tight text-ink;
+  }
+
+  /* A dashboard indicator light — used for connection/GPS/socket status
+     instead of a soft SaaS "pill". */
+  .led {
+    @apply inline-flex items-center gap-2 rounded-sm border border-tar-600 bg-tar-800 px-2.5 py-1.5 text-xs font-bold uppercase tracking-wide text-tar-400;
+  }
+
+  .led-dot {
+    @apply h-2 w-2 shrink-0 rounded-full bg-current;
+  }
+
+  .led-on {
+    @apply border-rank/40 bg-rank/10 text-rank;
+  }
+
+  .led-warn {
+    @apply border-taxi/40 bg-taxi/10 text-taxi;
+  }
+
+  .led-alert {
+    @apply border-brake/40 bg-brake/10 text-brake;
+  }
+
+  /* Primary action: the rank-yellow curb-paint button. */
+  .btn-rank {
+    @apply w-full rounded-sm border-2 border-ink bg-rank px-4 py-3.5 text-center font-display text-base font-black uppercase tracking-wide text-ink shadow-tape transition active:translate-y-px active:shadow-none disabled:opacity-50;
+  }
+
+  .btn-ghost {
+    @apply w-full rounded-sm border-2 border-tar-600 bg-transparent px-4 py-3 text-center text-sm font-bold uppercase tracking-wide text-tar-400 transition active:translate-y-px disabled:opacity-50;
+  }
+
+  .btn-brake {
+    @apply w-full rounded-sm border-2 border-brake bg-brake/10 px-4 py-3.5 text-center font-display text-sm font-black uppercase tracking-wide text-brake transition active:translate-y-px disabled:opacity-50;
+  }
+
+  /* A till/fare-slip ticket — the receipt for a boarding scan. */
+  .ticket {
+    @apply relative rounded-sm border-2 border-dashed border-tar-600 bg-board p-5 text-ink;
+  }
+
+  .ticket::before,
+  .ticket::after {
+    content: "";
+    @apply absolute h-4 w-4 rounded-full bg-tar;
+    top: -9px;
+  }
+  .ticket::before {
+    left: -9px;
+  }
+  .ticket::after {
+    right: -9px;
+  }
+
+  /* A rubber-stamp mark, rotated, overlaid on the ticket. */
+  .stamp {
+    @apply inline-block -rotate-6 rounded-sm border-[3px] px-3 py-1 font-display text-sm font-black uppercase tracking-[0.15em] shadow-stamp;
+  }
+
+  .stamp-paid {
+    @apply border-taxi text-taxi;
+  }
+
+  .stamp-replay {
+    @apply border-brake text-brake;
+  }
+}
