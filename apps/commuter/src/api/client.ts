@@ -1,4 +1,13 @@
-import type { AuthResponse, Route, RouteDetail, RouteSearchResult } from "../types";
+import type {
+  AuthResponse,
+  BalanceResponse,
+  IssuePassResponse,
+  RequestStopResponse,
+  Route,
+  RouteDetail,
+  RouteSearchResult,
+  TopupResponse,
+} from "../types";
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8080";
 
@@ -61,6 +70,27 @@ export const api = {
 
   searchRoutes: (from: string, to: string) =>
     request<RouteSearchResult>(`/routes/search?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
+
+  getBalance: () => request<BalanceResponse>("/wallet/balance"),
+
+  // Simulated top-up (Stage 2) — no real payment gateway behind this.
+  topup: (amountCents: number) =>
+    request<TopupResponse>("/wallet/topup", {
+      method: "POST",
+      body: JSON.stringify({ amount_cents: amountCents }),
+    }),
+
+  issuePass: (routeId: string, fromStopId: string, toStopId: string) =>
+    request<IssuePassResponse>("/boarding/pass", {
+      method: "POST",
+      body: JSON.stringify({ route_id: routeId, from_stop_id: fromStopId, to_stop_id: toStopId }),
+    }),
+
+  requestStop: (routeId: string, stopId: string) =>
+    request<RequestStopResponse>("/stops/request", {
+      method: "POST",
+      body: JSON.stringify({ route_id: routeId, stop_id: stopId }),
+    }),
 };
 
 /** The WebSocket base URL, derived from the HTTP API base (ws(s):// swap). */

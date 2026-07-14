@@ -6,6 +6,8 @@ import { BottomNav, type Tab } from "./components/BottomNav";
 import { MapScreen } from "./screens/MapScreen";
 import { SearchScreen } from "./screens/SearchScreen";
 import { RoutesScreen } from "./screens/RoutesScreen";
+import { WalletScreen } from "./screens/WalletScreen";
+import { BoardScreen } from "./screens/BoardScreen";
 
 export function CommuterApp({ auth: _auth }: { auth: AuthState }) {
   const { logout } = useAuth();
@@ -44,6 +46,10 @@ export function CommuterApp({ auth: _auth }: { auth: AuthState }) {
           selectedRouteId={viewedRouteId}
           onSelectRoute={setViewedRouteId}
         />
+      )}
+      {tab === "wallet" && <WalletScreen />}
+      {tab === "board" && (
+        <BoardScreen routes={routes} routeDetails={routeDetails} loading={loading} error={error} />
       )}
 
       <BottomNav active={tab} onChange={setTab} />

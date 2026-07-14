@@ -1725,3 +1725,129 @@ error screen; and opened a route's detail view (ordered stops + per-leg
 fares) both from a search result segment and from the Routes tab directly.
 
 Next: Stage 9b-ii — commuter app: wallet, boarding-pass generation, active trip
+
+---
+
+## Stage 9b-ii — commuter app: wallet, boarding pass, active trip — DONE (2026-07-14)
+
+Frontend only, no backend changes — extends `apps/commuter` (Stage 9b-i),
+reusing its `AuthContext`, typed `api` client, design tokens/components
+(`.board`, `.ticket`, `.tape`, `.flap`), and the `useRouteVehicles` hook. This
+is the stage that **closes the core loop**: a commuter tops up a wallet and
+generates the HMAC boarding-pass QR (Stage 5) that the driver app
+(`apps/driver`, Stage 9a) scans via `POST /boarding/scan`, charging the same
+Stage 2 ledger this app's wallet reads.
+
+Built:
+- `src/types.ts`, `src/api/client.ts` — added `BalanceResponse`,
+  `TopupResponse`, `IssuePassResponse`, `RequestStopResponse` wire types and
+  `api.getBalance`/`api.topup`/`api.issuePass`/`api.requestStop`, following
+  the existing hand-mirrored-from-Go-handlers pattern.
+- `src/hooks/useCountdown.ts` — ticks every 250ms toward an RFC3339
+  `expiresAt`, returning `{remainingMs, expired, label}` (`m:ss`). The one new
+  hook this stage needed — a short-TTL boarding pass (Stage 5, ~3 minutes)
+  needs a visibly live countdown, not a static timestamp.
+- `src/screens/WalletScreen.tsx` — `GET /wallet/balance` in Rands, a demo
+  top-up (`POST /wallet/topup`: R20/R50/R100 presets or a custom Rand amount,
+  converted to cents), explicitly labelled **"Demo top-up only... no real
+  payment gateway"** per CLAUDE.md's non-negotiable. A session-local list of
+  top-ups made from this device is shown underneath **SCOPE HONESTY**: there
+  is no backend endpoint exposing a commuter's own transaction history (only
+  `/owner/ledger`, Stage 8, owner-only, sees the full ledger), so this list is
+  explicitly a client-side session log, not ledger-derived, and says so
+  on-screen. A "Refresh" button re-fetches the balance, useful right after a
+  driver scans your pass elsewhere (this screen has no push channel).
+- `src/screens/BoardScreen.tsx` — the stage's signature screen, two states:
+  1. **Trip selection**: route dropdown, then from/to stop dropdowns
+     constrained to that route's stops in physical sequence order (derived
+     from `RouteDetail.legs` the same way `RoutesScreen` already does), the
+     "to" select disabling every stop at or before the chosen "from" — this
+     mirrors the increasing-sequence constraint `routing.FareForSegment`
+     (Stage 3/5) enforces server-side, so a submitted pair can never 404.
+     "Generate boarding pass" calls `POST /boarding/pass`.
+  2. **The boarding pass / active trip view**, once issued:
+     - **The QR is the hero**: `qrcode.react`'s `QRCodeSVG` renders
+       `pass_token` large and centered in a white card, matching the driver
+       app Scan screen's expectation of a camera-scannable code.
+     - A live countdown (`useCountdown`) to `expires_at` with a rotated
+       rubber-stamp verdict — `.stamp-live` (transit teal, "Valid") while
+       counting down, `.stamp-expired` (flag red, "Expired") once it hits
+       zero, at which point the QR is replaced by a "Generate new pass"
+       action for the same trip (state persists — only the issued pass is
+       cleared, not the route/stop selection).
+     - Fare in Rands and the route/from/to in plain language.
+     - A `<details>` "No camera? Show raw token" disclosure exposing the raw
+       `pass_token` string plus a clipboard-copy button — the fallback for
+       desktop/dev testing without a camera, pasted into the driver app's
+       manual-entry field exactly like Stage 9a's Scan screen expects.
+     - **Active trip (light MVP)**: a trip-status summary plus, if any
+       vehicles are currently online on the pass's route, their live seat
+       counts — reusing `useRouteVehicles`/`GET /ws/commuter` verbatim (no new
+       hook). **SCOPE HONESTY**: explicitly not a single-vehicle tracker —
+       telemetry (Stage 4) has no concept of "the vehicle assigned to this
+       commuter's specific trip," so this is an honest route-wide view, not a
+       faked "your driver is 200m away."
+     - **Request-a-pickup**: a small widget (stop select defaulting to the
+       route's first stop, "Request" button) calling `POST /stops/request`
+       (Stage 6's commuter-side counterpart to the driver app's alert
+       receipt) and rendering the real `driver_available` result — included
+       per the brief's "if it fits cleanly," kept to one card rather than a
+       separate tab/screen.
+- `src/index.css` — added `.stamp`/`.stamp-live`/`.stamp-expired`, the
+  commuter app's own rubber-stamp verdict styling (transit teal / flag red),
+  parallel to the driver app's Paid/Already-Paid stamp but reporting pass
+  validity instead of a charge outcome, since the commuter never sees the
+  charge itself (only the driver app does, on scan).
+- `src/components/BottomNav.tsx` — grew from 3 to 5 tabs (`Live`/`Search`/
+  `Routes`/`Wallet`/`Board`), grid updated to `grid-cols-5`.
+- `src/CommuterApp.tsx` — wired `WalletScreen`/`BoardScreen` into the two new
+  tabs.
+- `package.json` — added `qrcode.react` (a maintained, TypeScript-typed QR
+  rendering library) as the only new dependency this stage needed.
+
+Decisions / deviations from the original plan:
+- **A boarding pass is scoped to one route chosen up front, not derived from
+  a Search-tab result.** The brief's "reuse the stop-selection UI from 9b-i's
+  search" was interpreted as reusing the *pattern* (styled dropdowns
+  populated from real route/stop data) rather than literally wiring the
+  Search screen's cross-route multi-segment flow into pass issuance —
+  `POST /boarding/pass` only ever prices a single route's segment
+  (`routing.FareForSegment`), so a route-first, then-constrained-stops
+  selector is the more direct match for what the endpoint actually accepts,
+  and avoids the from/to constraint being checked in two different UI shapes.
+- **Bug found and fixed during Playwright verification**: the request-a-stop
+  select showed a default stop (falling back to the route's first stop when
+  no explicit selection had been made), but the "Request" button read the
+  underlying (still-empty) state variable directly and silently no-opped.
+  Fixed by resolving the effective stop id (explicit selection, or the same
+  fallback the select displays) at the call site and passing it into
+  `requestPickup` as an argument, rather than trusting a state variable the
+  UI's own default-display logic had already diverged from. Caught by
+  screenshotting the widget after clicking "Request" and seeing no result
+  text — a reminder that a value shown in a controlled input isn't
+  necessarily the value React state actually holds.
+- **`.env`/dependency housekeeping**: no `.env`/CORS changes needed — Stage
+  9a's dev-CORS (reflects any `Origin`) already covers this app's existing
+  port 5175.
+
+Verified: `npm install`, `npx tsc --noEmit`, and `npm run build` all pass
+cleanly. End-to-end verified against the live backend with Playwright
+(`playwright-core` pointed at the machine's cached Chromium build, since a
+fresh `npx playwright install` wasn't available in this environment) — see
+`apps/commuter/README.md`'s "Verified" section for the full walkthrough and
+exact numbers. Summary: brought seeded driver 1's vehicle online on "Cape
+Town CBD - Bellville" via `cmd/wsdriver`; in the real commuter app, screenshotted
+the wallet balance before/after a real R100 top-up (R3963.00 → R4063.00);
+generated a real boarding pass for Cape Town Station → Bellville Station
+(R11.00) and screenshotted the rendered QR, a ticking countdown (2:59 → 2:57
+across two screenshots), and the "Valid" stamp; **closed the loop** by taking
+that exact `pass_token` and `POST`ing it to `/boarding/scan` as the seeded
+driver — got back a fresh charge (`replayed:false`, fare 1100, split
+110/275/715, seats 16→15) and confirmed the commuter's wallet balance dropped
+by exactly the fare (R4063.00 → R4052.00), verified both via the API directly
+and by reloading the commuter app's Wallet screen and screenshotting the same
+new balance rendered in the real UI; and exercised request-a-stop end-to-end,
+confirming the real `driver_available:true` result rendered in the UI after
+the fix above.
+
+Next: Stage 9c — owner dashboard

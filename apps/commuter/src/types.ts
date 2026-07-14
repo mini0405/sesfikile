@@ -81,6 +81,29 @@ export interface CommuterOfflineMessage {
 
 export type CommuterWSMessage = CommuterSnapshotMessage | CommuterUpdateMessage | CommuterOfflineMessage;
 
+export interface BalanceResponse {
+  account_type: string;
+  balance_cents: number;
+}
+
+export interface TopupResponse {
+  transaction_id: string;
+  balance_cents: number;
+}
+
+export interface IssuePassResponse {
+  pass_token: string;
+  expires_at: string;
+  fare_cents: number;
+}
+
+export interface RequestStopResponse {
+  request_id: string;
+  status: string;
+  driver_available: boolean;
+  message?: string;
+}
+
 export interface ApiError {
   error: string;
 }
