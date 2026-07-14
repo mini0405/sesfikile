@@ -3,6 +3,65 @@
 Running record of what's actually been built, stage by stage. Read this first to see
 current state before starting new work.
 
+## Baseline verified — clean-slate build green (2026-07-14)
+
+Full clean-slate verification, not new work — confirms the state below is reproducible
+from nothing, not an artifact of an accumulated dev environment.
+
+**Current state**: backend feature-complete through Stage 8 (identity, wallet+ledger,
+routing, telemetry, boarding, request-a-stop, fuel (mock), owner analytics), plus the
+backend-cleanup pass (`/stops`, commuter transaction history, list `[]` serialization),
+the test-data-isolation housekeeping pass (`cmd/cleanup`), and the fuel anti-bypass
+test-isolation fix. Three frontend apps: `apps/driver` (9a), `apps/commuter` (9b-i live
+map/search + 9b-ii wallet/boarding-pass), `apps/owner` (9c dashboard) — all built against
+the Stage 0-8 API surface with no backend changes since. Stage 9d (cross-cutting polish)
+not started; the MVP feature set is otherwise complete.
+
+**Verified this pass**: fresh Postgres (`docker compose down -v` then `up` — a genuinely
+empty volume, not a reset schema), migrations + `cmd/seed` run from empty — produced
+exactly the 8 real Cape Town corridors and 12 real stops (3 interchanges: Athlone, Cape
+Town Station, Wynberg), no leftover test junk. `go test -race -count=1 ./...` green in
+every package, **no `-p 1` needed** — the suite is race-clean and parallel-safe. All
+three apps: `npm install` + `npx tsc --noEmit` + `npm run build` all succeed clean.
+
+**Non-blocking, deferred (noted for honesty, not acted on)**:
+- `npm audit` reports 2 advisories in transitive dev dependencies. Not running
+  `audit fix --force` — that command rewrites direct dependency versions to satisfy
+  transitive advisories and has a history of silently introducing breaking changes;
+  not worth the risk for dev-only transitive findings at this stage.
+- `apps/owner`'s bundle exceeds Vite's 500kB chunk-size advisory (Recharts), and
+  `apps/driver`'s bundle is heavy (html5-qrcode). Both build and run correctly as-is;
+  code-splitting is a candidate only if/when deploying over real mobile networks, not
+  before.
+
+### Stand this up from scratch (PowerShell)
+
+```powershell
+# 1. Fresh Postgres (drops any existing volume — genuinely empty)
+cd infra
+docker compose down -v
+docker compose up -d
+cd ..
+
+# 2. Backend: migrate + seed from empty
+cd backend
+$env:DATABASE_URL = "postgres://sesfikile:sesfikile_dev@localhost:5432/sesfikile?sslmode=disable"
+go run ./cmd/seed        # applies migrations, then seeds the 8 real corridors
+
+# 3. Backend test suite (race-clean, parallel-safe — no -p 1 needed)
+go test -race -count=1 ./...
+
+# 4. Backend server (separate terminal, for frontend dev against it)
+go run ./cmd/server
+
+# 5. Each frontend app (separate terminals; ports 5174/5175/5176)
+cd ..\apps\driver;   npm install; npx tsc --noEmit; npm run build; npm run dev
+cd ..\apps\commuter; npm install; npx tsc --noEmit; npm run build; npm run dev
+cd ..\apps\owner;    npm install; npx tsc --noEmit; npm run build; npm run dev
+```
+
+---
+
 ## Stage 0 — scaffold + infra — DONE (2026-07-13)
 
 Built:
@@ -2430,3 +2489,77 @@ from the brief — **no `-p 1`, run twice each**:
 runs) — all four runs passed cleanly against the same live, not-reset
 Postgres, with zero flakes. Route/stop counts stayed at exactly 8/12
 throughout (no regression on the housekeeping pass above).
+
+---
+
+## Baseline verified — clean-slate build green (2026-07-14)
+
+A from-scratch verification pass, not new work: tore down the dev Postgres
+entirely (`docker compose down -v` — drops the named volume, so this is a
+genuinely empty database, not just an empty schema) and rebuilt everything
+from nothing to confirm the repo's current state is reproducible, not an
+artifact of an accumulated dev environment.
+
+**Current state**:
+- **Backend** (`sesfikile/backend`, Go): feature-complete through Stage 8,
+  plus the two follow-up passes above — Stage 0 scaffold/infra, Stage 1
+  identity, Stage 2 wallet+ledger, Stage 3 routing, Stage 4 telemetry,
+  Stage 5 boarding (QR scan), Stage 6 request-a-stop, Stage 7 fuel (mock),
+  Stage 8 owner analytics, the backend-cleanup pass (`/stops`, commuter
+  transaction history, list `[]` serialization), the housekeeping pass
+  (test-data isolation + `cmd/cleanup`), and the fuel anti-bypass
+  test-isolation fix. Stage 9d (cross-cutting polish) is not started; the
+  MVP feature set is otherwise complete.
+- **Frontend**: three independent Vite/React/TypeScript apps, all built
+  against the Stage 0-8 API surface only (no backend changes since) —
+  `apps/driver` (Stage 9a, port 5174), `apps/commuter` (Stage 9b-i live
+  map/search + 9b-ii wallet/boarding-pass/active-trip, port 5175),
+  `apps/owner` (Stage 9c dashboard, port 5176).
+- **Test suite**: race-clean and parallel-safe — `go test ./...` and
+  `go test -race ./...` both pass with no `-p 1` needed (the fuel
+  anti-bypass fix above was the last source of cross-package flakiness).
+- **Seed data**: `cmd/seed` from an empty database produces exactly the 8
+  real Cape Town corridor routes and 12 real stops (3 interchanges:
+  Athlone, Cape Town Station, Wynberg) — no leftover test-generated junk,
+  confirmed via `cmd/cleanup`'s dry run reporting 0/0 immediately after
+  seeding.
+
+**This verification pass**:
+1. `docker compose down -v` then `docker compose up -d` in `infra/` — a
+   genuinely empty Postgres 16, not a reset schema on an old volume.
+2. `go run ./cmd/server` (or `cmd/seed` directly) applies all migrations
+   from scratch against the empty database.
+3. `go run ./cmd/seed` from empty — produced the 8 corridors / 12 stops
+   above with no prior state to inherit.
+4. `go test -race -count=1 ./...` — green, no `-p 1`.
+5. In each of `apps/driver`, `apps/commuter`, `apps/owner`: `npm install`,
+   `npx tsc --noEmit`, `npm run build` — all clean.
+
+No code changes in this pass — this entry only records that the above was
+run and passed against a genuinely empty environment.
+
+### Standing this up from scratch (PowerShell)
+
+```powershell
+# 1. Fresh Postgres (drops any existing volume — genuinely empty)
+cd infra
+docker compose down -v
+docker compose up -d
+cd ..
+
+# 2. Backend: migrate + seed from empty
+cd backend
+$env:DATABASE_URL = "postgres://sesfikile:sesfikile_dev@localhost:5432/sesfikile?sslmode=disable"
+go run ./cmd/seed        # applies migrations, then seeds the 8 real corridors
+
+# 3. Backend test suite (race-clean, parallel-safe — no -p 1 needed)
+go test -race -count=1 ./...
+
+# 4. Backend server (separate terminal, for frontend dev against it)
+go run ./cmd/server
+
+# 5. Each frontend app (separate terminals; ports 5174/5175/5176)
+cd ..\apps\driver;   npm install; npx tsc --noEmit; npm run build; npm run dev
+cd ..\apps\commuter; npm install; npx tsc --noEmit; npm run build; npm run dev
+cd ..\apps\owner;    npm install; npx tsc --noEmit; npm run build; npm run dev
+```
