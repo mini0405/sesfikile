@@ -89,6 +89,78 @@ func (h *Handlers) ListRoutes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+type stopResponse struct {
+	ID        string  `json:"id"`
+	Name      string  `json:"name"`
+	Latitude  float64 `json:"latitude"`
+	Longitude float64 `json:"longitude"`
+}
+
+func toStopResponse(s Stop) stopResponse {
+	return stopResponse{ID: s.ID.String(), Name: s.Name, Latitude: s.Latitude, Longitude: s.Longitude}
+}
+
+// ListStops handles GET /stops and GET /stops?route_id=<id>. Public read,
+// consistent with /routes being public reference data (Stage 3) — a
+// commuter should be able to see the stop list before logging in.
+//
+// With no route_id, it returns every stop, alphabetical (same ordering as
+// Repo.ListStops/ListRoutes). With route_id, it returns that route's own
+// stops in physical sequence order — derived from the route's ordered legs,
+// not alphabetical — which is what a commuter app needs to build
+// from/to pickers that can't produce an invalid (out-of-sequence) pair.
+func (h *Handlers) ListStops(w http.ResponseWriter, r *http.Request) {
+	routeIDParam := r.URL.Query().Get("route_id")
+	if routeIDParam == "" {
+		stops, err := h.repo.ListStops(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to list stops")
+			return
+		}
+		resp := make([]stopResponse, 0, len(stops))
+		for _, s := range stops {
+			resp = append(resp, toStopResponse(s))
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
+	routeID, err := uuid.Parse(routeIDParam)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "route_id must be a valid uuid")
+		return
+	}
+	if _, err := h.repo.GetRouteByID(r.Context(), routeID); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusNotFound, "route not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load route")
+		return
+	}
+
+	legs, err := h.repo.ListLegsForRoute(r.Context(), routeID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load route legs")
+		return
+	}
+
+	stops, err := h.stopsByID(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load stops")
+		return
+	}
+
+	resp := make([]stopResponse, 0, len(legs)+1)
+	if len(legs) > 0 {
+		resp = append(resp, toStopResponse(stops[legs[0].FromStopID]))
+		for _, l := range legs {
+			resp = append(resp, toStopResponse(stops[l.ToStopID]))
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
 type routeDetailResponse struct {
 	Route routeResponse `json:"route"`
 	Legs  []legResponse `json:"legs"`

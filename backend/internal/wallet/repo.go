@@ -291,6 +291,50 @@ func (r *Repo) InternalTransfer(ctx context.Context, ownerUserID uuid.UUID, from
 	return txn, nil
 }
 
+// ListTransactionsForAccount returns accountID's own ledger postings
+// (joined back to their parent transaction), newest first, paginated via
+// limit/offset — the same shape as analytics.Repo.Ledger (Stage 8), scoped
+// to a single account instead of unioned across an owner's fleet. Every
+// figure comes straight from ledger_postings, same reconciliation principle
+// as the rest of the ledger: no separate tally.
+func (r *Repo) ListTransactionsForAccount(ctx context.Context, accountID uuid.UUID, limit, offset int) ([]Transaction, int64, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT lt.id, lt.kind, lp.amount_cents, lt.created_at,
+		        NULLIF(lt.metadata->>'vehicle_id', '')::uuid
+		 FROM ledger_postings lp
+		 JOIN ledger_transactions lt ON lt.id = lp.transaction_id
+		 WHERE lp.account_id = $1
+		 ORDER BY lt.created_at DESC, lt.id DESC
+		 LIMIT $2 OFFSET $3`,
+		accountID, limit, offset,
+	)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	txns := []Transaction{}
+	for rows.Next() {
+		var t Transaction
+		if err := rows.Scan(&t.TransactionID, &t.Kind, &t.AmountCents, &t.OccurredAt, &t.VehicleID); err != nil {
+			return nil, 0, err
+		}
+		txns = append(txns, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+
+	var total int64
+	if err := r.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM ledger_postings WHERE account_id = $1`, accountID,
+	).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	return txns, total, nil
+}
+
 // FareSplit is the resolved cent breakdown of a single fare charge.
 type FareSplit struct {
 	PlatformCents int64

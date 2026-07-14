@@ -429,26 +429,45 @@ func TestEmptyState_NoActivityReturnsCleanZeros(t *testing.T) {
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %+v", status, body)
 	}
-	if vehicles, ok := body["vehicles"].([]any); ok && len(vehicles) != 0 {
-		t.Fatalf("expected empty vehicle list, got %d", len(vehicles))
-	}
+	assertEmptyJSONArray(t, body, "vehicles")
 
 	status, body = doJSON(t, env.server, http.MethodGet, "/owner/drivers", ownerTok)
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %+v", status, body)
 	}
-	if drivers, ok := body["drivers"].([]any); ok && len(drivers) != 0 {
-		t.Fatalf("expected empty driver list, got %d", len(drivers))
-	}
+	assertEmptyJSONArray(t, body, "drivers")
 
 	status, body = doJSON(t, env.server, http.MethodGet, "/owner/ledger", ownerTok)
 	if status != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %+v", status, body)
 	}
-	if entries, ok := body["entries"].([]any); ok && len(entries) != 0 {
-		t.Fatalf("expected empty ledger, got %d", len(entries))
-	}
+	assertEmptyJSONArray(t, body, "entries")
 	if total := body["total"].(float64); total != 0 {
 		t.Fatalf("expected total 0, got %v", total)
+	}
+}
+
+// assertEmptyJSONArray fails unless body[key] decoded as an empty JSON
+// array ([]any{}), not JSON null — a plain type assertion
+// (body[key].([]any)) silently reports ok=false for both "absent" and
+// "decoded as null", which let a real null-vs-[] regression slip past this
+// test previously (see docs/PROGRESS.md's backend-cleanup entry). Decoding
+// into json.RawMessage first and comparing bytes distinguishes "null" from
+// "[]" unambiguously.
+func assertEmptyJSONArray(t *testing.T, body map[string]any, key string) {
+	t.Helper()
+	raw, ok := body[key]
+	if !ok {
+		t.Fatalf("expected %q key present in response", key)
+	}
+	if raw == nil {
+		t.Fatalf("expected %q to serialize as an empty JSON array [], got null", key)
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		t.Fatalf("expected %q to be a JSON array, got %#v", key, raw)
+	}
+	if len(arr) != 0 {
+		t.Fatalf("expected %q to be empty, got %d entries", key, len(arr))
 	}
 }

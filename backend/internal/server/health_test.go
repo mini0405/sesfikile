@@ -32,10 +32,10 @@ func (f fakePinger) Ping(ctx context.Context) error {
 
 func testRouter(pinger Pinger) chi.Router {
 	tokens := identity.NewTokenIssuer("test-secret")
-	handlers := identity.NewHandlers(identity.NewRepo(nil), tokens)
-	walletHandlers := wallet.NewHandlers(wallet.NewRepo(nil), config.FareSplit{PlatformPct: 10, DriverPct: 25, OwnerPct: 65})
-	routingHandlers := routing.NewHandlers(routing.NewRepo(nil))
 	identityRepo := identity.NewRepo(nil)
+	handlers := identity.NewHandlers(identityRepo, tokens)
+	walletHandlers := wallet.NewHandlers(wallet.NewRepo(nil), config.FareSplit{PlatformPct: 10, DriverPct: 25, OwnerPct: 65}, identityRepo)
+	routingHandlers := routing.NewHandlers(routing.NewRepo(nil))
 	routingRepo := routing.NewRepo(nil)
 	telemetryStore := telemetry.NewVehicleStateStore()
 	telemetryHub := telemetry.NewHub()

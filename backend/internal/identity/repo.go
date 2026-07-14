@@ -173,7 +173,7 @@ func (r *Repo) ListVehiclesByOwnerUserID(ctx context.Context, ownerUserID uuid.U
 	}
 	defer rows.Close()
 
-	var vehicles []Vehicle
+	vehicles := []Vehicle{}
 	for rows.Next() {
 		var v Vehicle
 		if err := rows.Scan(&v.ID, &v.OwnerUserID, &v.Registration, &v.Capacity, &v.AssociationName, &v.ComplianceStatus, &v.CreatedAt, &v.UpdatedAt); err != nil {
@@ -239,7 +239,7 @@ func (r *Repo) ListDriversByOwnerUserID(ctx context.Context, ownerUserID uuid.UU
 	}
 	defer rows.Close()
 
-	var drivers []Driver
+	drivers := []Driver{}
 	for rows.Next() {
 		var d Driver
 		if err := rows.Scan(&d.ID, &d.UserID, &d.FullName, &d.PRDPNumber, &d.PRDPVerified, &d.IDNumber, &d.KYCStatus, &d.CreatedAt, &d.UpdatedAt); err != nil {

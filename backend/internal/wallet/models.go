@@ -62,3 +62,19 @@ type LedgerPosting struct {
 	AmountCents   int64
 	CreatedAt     time.Time
 }
+
+// Transaction is one account-scoped row of ledger activity — a posting
+// joined back to its parent ledger_transactions row. It's the read model
+// behind GET /wallet/transactions (a single account's own postings), the
+// same postings-are-truth derivation Stage 8's owner ledger already uses
+// for GET /owner/ledger, just scoped to one account instead of unioned
+// across an owner's whole fleet. AmountCents is signed, same convention as
+// LedgerPosting. VehicleID is only set for fare transactions (carried in
+// ledger_transactions.metadata at charge time) — nil for topups.
+type Transaction struct {
+	TransactionID uuid.UUID
+	Kind          TransactionKind
+	AmountCents   int64
+	OccurredAt    time.Time
+	VehicleID     *uuid.UUID
+}

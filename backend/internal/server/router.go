@@ -35,6 +35,7 @@ func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identi
 	r.Get("/routes", routingHandlers.ListRoutes)
 	r.Get("/routes/search", routingHandlers.Search)
 	r.Get("/routes/{id}", routingHandlers.GetRoute)
+	r.Get("/stops", routingHandlers.ListStops)
 
 	// /ws/driver validates its own JWT on the handshake (query param or
 	// header — see telemetry.bearerToken) rather than via RequireAuth,
@@ -60,6 +61,7 @@ func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identi
 		r.Group(func(r chi.Router) {
 			r.Use(identity.RequireRole(identity.RoleCommuter))
 			r.Post("/wallet/topup", walletHandlers.Topup)
+			r.Get("/wallet/transactions", walletHandlers.Transactions)
 			r.Post("/boarding/pass", boardingHandlers.IssuePass)
 			r.Post("/stops/request", stopsHandlers.RequestStop)
 		})

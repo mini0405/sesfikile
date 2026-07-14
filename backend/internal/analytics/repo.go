@@ -257,7 +257,7 @@ func (r *Repo) dailySeries(ctx context.Context, sql string, ownerUserID uuid.UUI
 	}
 	defer rows.Close()
 
-	var buckets []dailyBucket
+	buckets := []dailyBucket{}
 	for rows.Next() {
 		var b dailyBucket
 		if err := rows.Scan(&b.Day, &b.AmountCents); err != nil {
@@ -320,7 +320,7 @@ func (r *Repo) Ledger(ctx context.Context, ownerUserID uuid.UUID, from, to time.
 	}
 	defer rows.Close()
 
-	var entries []LedgerEntry
+	entries := []LedgerEntry{}
 	for rows.Next() {
 		var e LedgerEntry
 		if err := rows.Scan(&e.ID, &e.EntryType, &e.OccurredAt, &e.AmountCents, &e.VehicleID, &e.Detail); err != nil {

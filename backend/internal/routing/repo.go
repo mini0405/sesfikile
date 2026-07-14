@@ -66,7 +66,7 @@ func (r *Repo) ListStops(ctx context.Context) ([]Stop, error) {
 	}
 	defer rows.Close()
 
-	var stops []Stop
+	stops := []Stop{}
 	for rows.Next() {
 		var s Stop
 		if err := rows.Scan(&s.ID, &s.Name, &s.Latitude, &s.Longitude, &s.CreatedAt); err != nil {
@@ -124,7 +124,7 @@ func (r *Repo) ListRoutes(ctx context.Context) ([]Route, error) {
 	}
 	defer rows.Close()
 
-	var routes []Route
+	routes := []Route{}
 	for rows.Next() {
 		var rt Route
 		if err := rows.Scan(&rt.ID, &rt.Name, &rt.AssociationName, &rt.CreatedAt); err != nil {
@@ -158,7 +158,7 @@ func (r *Repo) ListLegsForRoute(ctx context.Context, routeID uuid.UUID) ([]Route
 	}
 	defer rows.Close()
 
-	var legs []RouteLeg
+	legs := []RouteLeg{}
 	for rows.Next() {
 		var l RouteLeg
 		if err := rows.Scan(&l.ID, &l.RouteID, &l.FromStopID, &l.ToStopID, &l.Sequence, &l.FareCents, &l.CreatedAt); err != nil {

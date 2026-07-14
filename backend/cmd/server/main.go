@@ -51,7 +51,7 @@ func main() {
 	} else {
 		logger.Info("system accounts ready")
 	}
-	walletHandlers := wallet.NewHandlers(walletRepo, cfg.FareSplit)
+	walletHandlers := wallet.NewHandlers(walletRepo, cfg.FareSplit, identityRepo)
 
 	routingRepo := routing.NewRepo(database.Pool)
 	routingHandlers := routing.NewHandlers(routingRepo)

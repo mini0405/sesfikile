@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -12,12 +14,17 @@ import (
 )
 
 type Handlers struct {
-	repo  *Repo
-	split config.FareSplit
+	repo         *Repo
+	split        config.FareSplit
+	identityRepo *identity.Repo
 }
 
-func NewHandlers(repo *Repo, split config.FareSplit) *Handlers {
-	return &Handlers{repo: repo, split: split}
+// NewHandlers wires wallet.Repo to /wallet/*. identityRepo is only used by
+// Transactions, to resolve a fare posting's vehicle_id (carried in ledger
+// metadata) into a human-readable registration — reusing Stage 1's data
+// rather than duplicating vehicle lookups.
+func NewHandlers(repo *Repo, split config.FareSplit, identityRepo *identity.Repo) *Handlers {
+	return &Handlers{repo: repo, split: split, identityRepo: identityRepo}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -179,5 +186,88 @@ func (h *Handlers) ChargeFare(w http.ResponseWriter, r *http.Request) {
 		PlatformCents: split.PlatformCents,
 		DriverCents:   split.DriverCents,
 		OwnerCents:    split.OwnerCents,
+	})
+}
+
+type transactionResponse struct {
+	TransactionID       string    `json:"transaction_id"`
+	Kind                string    `json:"kind"`
+	AmountCents         int64     `json:"amount_cents"`
+	OccurredAt          time.Time `json:"occurred_at"`
+	VehicleID           *string   `json:"vehicle_id,omitempty"`
+	VehicleRegistration *string   `json:"vehicle_registration,omitempty"`
+}
+
+type transactionsPageResponse struct {
+	Transactions []transactionResponse `json:"transactions"`
+	Total        int64                 `json:"total"`
+	Limit        int                   `json:"limit"`
+	Offset       int                   `json:"offset"`
+}
+
+// Transactions handles GET /wallet/transactions?limit=&offset= (commuter
+// only). Identity is taken from the validated JWT (claims.UserID), never a
+// request parameter — the query is scoped server-side to the caller's own
+// commuter_wallet account id, the same structural-not-filtered scoping
+// pattern Stage 8's /owner/* handlers use (ownerFromContext).
+func (h *Handlers) Transactions(w http.ResponseWriter, r *http.Request) {
+	claims, ok := identity.ClaimsFromContext(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	acc, err := h.repo.GetOrCreateAccount(r.Context(), h.repo.pool, &claims.UserID, AccountCommuterWallet)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load account")
+		return
+	}
+
+	limit := 50
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	offset := 0
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+
+	txns, total, err := h.repo.ListTransactionsForAccount(r.Context(), acc.ID, limit, offset)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to load transactions")
+		return
+	}
+
+	resp := make([]transactionResponse, 0, len(txns))
+	for _, t := range txns {
+		tr := transactionResponse{
+			TransactionID: t.TransactionID.String(),
+			Kind:          string(t.Kind),
+			AmountCents:   t.AmountCents,
+			OccurredAt:    t.OccurredAt,
+		}
+		if t.VehicleID != nil {
+			vid := t.VehicleID.String()
+			tr.VehicleID = &vid
+			if vehicle, err := h.identityRepo.GetVehicleByID(r.Context(), *t.VehicleID); err == nil {
+				reg := vehicle.Registration
+				tr.VehicleRegistration = &reg
+			}
+		}
+		resp = append(resp, tr)
+	}
+
+	writeJSON(w, http.StatusOK, transactionsPageResponse{
+		Transactions: resp,
+		Total:        total,
+		Limit:        limit,
+		Offset:       offset,
 	})
 }

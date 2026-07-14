@@ -2033,3 +2033,171 @@ new way to read the existing one.
 Next: Stage 9d — cross-cutting polish / demo prep, or the MVP feature set
 (stages 0–9c) may be considered functionally complete for a demo, at the
 team's discretion.
+
+---
+
+## Backend cleanup — `/stops`, commuter transaction history, list `[]` serialization — DONE (2026-07-14)
+
+Additive/corrective backend-only pass closing three gaps the Stage 9 frontend
+arc surfaced along the way. No changes to `apps/driver`, `apps/commuter`, or
+`apps/owner` in this pass — existing frontend workarounds are still in place
+and still work; this just makes the backend correct at the source.
+
+**Gap 1 — list endpoints must return `[]`, not `null`.** Found the root
+cause: several repo-level list queries declared their result as `var x []T`
+(a nil slice until the first `append`), which `encoding/json` serializes as
+`null` for the empty case. Most handlers already re-wrapped these into a
+`make([]T, 0, len(x))` response slice before serializing (safe regardless of
+whether the repo returned nil), but two call sites serialized the repo
+result directly: `analytics.Repo.Ledger`'s `entries` (the exact bug Stage
+9c's owner-dashboard `?? []` guard was worked around) and
+`analytics.Repo.dailySeries`'s `buckets` (feeds `revenue-vs-fuel`'s series,
+though its handler already re-wrapped it — fixed at the source anyway for
+consistency). Fixed **at the source, everywhere**, by changing every
+`var x []T` list-accumulator to `x := []T{}` before the scan loop, so a
+nil-vs-empty distinction can never leak into a JSON response from any layer
+again — not just the handlers that happened to re-wrap:
+`analytics.Repo.{Ledger,dailySeries}`, `routing.Repo.{ListStops,ListRoutes,
+ListLegsForRoute}`, `identity.Repo.{ListVehiclesByOwnerUserID,
+ListDriversByOwnerUserID}`, `telemetry.VehicleStateStore.ListByRoute`. Picked
+this over normalizing at the response boundary (e.g. a generic "nilToEmpty"
+JSON-marshal wrapper) since it's one keystroke per call site, requires no new
+abstraction, and matches the style every handler already uses
+(`make([]T, 0, len(...))`) — one consistent rule: **lists are never nil past
+the query loop that builds them.**
+  - The Stage 9c owner-dashboard `?? []` guard in `apps/owner/src/screens/
+    LedgerScreen.tsx` is now **redundant** — `GET /owner/ledger` returns a
+    real `[]` for an empty range, so the guard is dead code, not a
+    workaround for live behavior anymore. Left in place per this pass's
+    frontend-untouched scope; safe to delete in a future frontend stage.
+  - Tests: `internal/analytics/analytics_test.go`'s existing
+    `TestEmptyState_NoActivityReturnsCleanZeros` had a latent gap of its
+    own — its assertions used a bare `body["vehicles"].([]any)` type
+    assertion and only checked length `if ok`, which silently reports
+    `ok=false` (and skips the check entirely) for a JSON `null` exactly as
+    readily as for "key absent" — so it could never have caught the `Ledger`
+    nil-slice bug it was sitting next to. Replaced with a new
+    `assertEmptyJSONArray` helper that explicitly fails on `null` before
+    asserting the array is empty, and used it for `vehicles`/`drivers`/
+    `entries`. New: `internal/routing/stops_handler_test.go`'s
+    `TestListStops_EmptyRouteReturnsEmptyArray` (decodes the raw response
+    body and asserts it's the literal bytes `[]`) and
+    `internal/wallet/transactions_test.go`'s
+    `TestTransactions_EmptyCommuterReturnsEmptyArray`.
+
+**Gap 2 — `GET /stops` (server-side stop resolution).** Stage 9b-i's
+commuter app had flagged this gap explicitly (`useRoutesData.ts`): with no
+stops endpoint, it reconstructed the stop list client-side from `GET
+/routes` + `GET /routes/{id}` per route. The repo-level `routing.Repo.
+ListStops` already existed (used internally by `stopsByID` for other
+handlers) — this just exposes it:
+  - `GET /stops` — every stop (`id`, `name`, `latitude`, `longitude`),
+    alphabetical, same ordering as `GET /routes`. Public, no auth — reference
+    data, consistent with `/routes` (Stage 3) and `/telemetry/vehicles`
+    (Stage 4) already being public.
+  - `GET /stops?route_id=<id>` — added as the "your call, small addition"
+    option, since a commuter's from/to picker actually needs a route's own
+    stops **in physical sequence order**, not the alphabetical full list —
+    exactly the ordering `boarding`'s `FareForSegment` (Stage 5) and the
+    commuter app's Board screen (Stage 9b-ii) already assume. Derived from
+    the route's ordered legs (`ListLegsForRoute`, Stage 3): the first leg's
+    `from_stop`, then every leg's `to_stop`, walked in `sequence` order — no
+    new query shape, reuses exactly what `GET /routes/{id}` already loads.
+    404s on an unknown `route_id` (doesn't silently fall back to the
+    unfiltered list); a route with zero legs returns `[]` (Gap 1).
+  - `internal/routing/handlers.go` — new `ListStops` handler,
+    `stopResponse`/`toStopResponse`. `internal/server/router.go` — wired
+    `GET /stops` alongside the other public `/routes*` routes.
+  - Tests (`internal/routing/stops_handler_test.go`, real Postgres, skips if
+    unreachable like every other DB-backed test in the repo):
+    `TestListStops_ReturnsSeededStops` (unfiltered list includes known
+    seeded corridor stops by name), `TestListStops_EmptyRouteReturnsEmptyArray`,
+    `TestListStops_FilteredByRoute_ReturnsOrderedStops` (against the
+    synthetic A→B→I fixture already shared with `integration_test.go`,
+    asserts exact sequence order, not alphabetical), `TestListStops_
+    UnknownRoute404s`.
+  - **Not done in this pass**: migrating `apps/commuter`'s `useRoutesData.ts`
+    off its client-side reconstruction onto the new endpoint — that's a
+    frontend change, out of scope here per the brief. The endpoint now
+    exists for a future frontend stage to adopt.
+
+**Gap 3 — `GET /wallet/transactions` (commuter transaction history).** The
+commuter app could show a wallet balance (Stage 2's `GET /wallet/balance`)
+but never its history — Stage 9b-ii's `WalletScreen.tsx` explicitly flagged
+this as a client-side-session-log-only workaround, since no endpoint existed.
+Added, following Stage 8's owner-ledger reconciliation and pagination
+pattern exactly:
+  - `GET /wallet/transactions?limit=&offset=` (auth: commuter only) — the
+    caller's own `commuter_wallet` account postings, joined back to their
+    parent `ledger_transactions` row, **newest first**
+    (`ORDER BY lt.created_at DESC, lt.id DESC`), each with `transaction_id`,
+    `kind` (`topup`/`fare`), `amount_cents` (signed, same convention as
+    every other ledger figure in this codebase), `occurred_at`, and — for
+    fare transactions only — `vehicle_id`/`vehicle_registration` (resolved
+    via `identity.Repo.GetVehicleByID` from the `vehicle_id` Stage 2's
+    `ChargeFare` already stores in `ledger_transactions.metadata`).
+    `limit`/`offset` default 50/0, capped at 200, matching `/owner/ledger`'s
+    exact pagination shape and defaults. Response:
+    `{transactions, total, limit, offset}`.
+  - **Route/trip context is NOT included** — flagged rather than silently
+    dropped. A fare transaction's metadata carries `vehicle_id` (set once at
+    charge time), not `route_id`; the driver-vehicle-route association that
+    *would* answer "which route was this" lives only in Stage 4's in-memory
+    `VehicleStateStore` (resets on restart, no historical log — the same
+    accepted MVP trade-off Stage 8's package doc already documents for live
+    fleet status). So a historical fare genuinely has no persisted route to
+    report days later; `vehicle_registration` is the honest context that
+    *is* available and durable.
+  - **Strict scoping, same structural pattern as Stage 8's `/owner/*`**:
+    identity comes from `identity.ClaimsFromContext` (the validated JWT),
+    never a request parameter — there is no `commuter_id` field on this
+    endpoint to even attempt passing. The query is `WHERE lp.account_id =
+    $1` against the caller's own lazily-resolved `commuter_wallet` account
+    id (`GetOrCreateAccount`, same lazy-creation Stage 2's `Balance` handler
+    already uses), so a second commuter's rows are structurally unreachable,
+    not merely filtered out after the fact.
+  - `internal/wallet/models.go` — new `Transaction` (repo-level read model:
+    `TransactionID`, `Kind`, `AmountCents`, `OccurredAt`, `VehicleID`).
+    `internal/wallet/repo.go` — new `Repo.ListTransactionsForAccount`
+    (postings→transaction join + a separate `COUNT(*)` for `total`, same
+    two-query shape as `analytics.Repo.Ledger`). `internal/wallet/
+    handlers.go` — new `Handlers.Transactions`; `Handlers`/`NewHandlers`
+    gained an `identityRepo *identity.Repo` parameter (wallet already
+    imported `identity` for `ClaimsFromContext`/`Role`, so no import cycle)
+    — both call sites (`cmd/server/main.go`, `internal/server/health_test.go`)
+    updated to pass it. `internal/server/router.go` — wired `GET
+    /wallet/transactions` into the existing commuter-only route group
+    alongside `POST /wallet/topup`.
+  - Tests (`internal/wallet/transactions_test.go`, real Postgres, driven as
+    raw HTTP through `identity.RequireAuth`/`RequireRole` with real bearer
+    tokens, same "test it as a raw token over HTTP" approach Stage 5's
+    boarding tests established): `TestTransactions_
+    TopupsAndFaresOrderedAndReconciled` (a top-up + a fare charge appear
+    newest-first, amounts sum to exactly the reported wallet balance — no
+    separate tally, straight off postings — and the fare entry carries
+    vehicle context while the topup doesn't), `TestTransactions_
+    EmptyCommuterReturnsEmptyArray`, `TestTransactions_
+    CrossCommuterIsolation` (commuter B, with their own zero activity, sees
+    `[]` — never commuter A's top-up — mirroring Stage 8's
+    `TestScoping_OwnerCannotSeeAnotherOwnersData` exactly).
+  - **Not done in this pass**: migrating `apps/commuter`'s `WalletScreen.tsx`
+    off its client-side session-log onto this endpoint — frontend change,
+    out of scope here. The endpoint now exists for a future frontend stage
+    to adopt.
+
+Verified: `go build ./...`, `go vet ./...`, `gofmt -l .`, and `go mod tidy`
+all clean (no `go.mod`/`go.sum` diff — no new dependencies). Full test suite
+(`go test ./...`) passes against a live Postgres, including every new test
+above and zero regressions in any prior stage's tests. `go test -race ./...`
+(MSYS2 `ucrt64` gcc toolchain, same as Stages 4/5) also passes cleanly across
+every package with **no data races detected**. End-to-end verified by hand
+against the live seeded backend: `GET /stops` (full alphabetical list),
+`GET /stops?route_id=<Cape Town CBD - Bellville>` (returned exactly
+Cape Town Station → Parow → Bellville Station, in that physical order, not
+alphabetical), `GET /wallet/transactions` as seeded commuter 1 (fare charges
+newest-first with correct vehicle/registration context) and as seeded
+commuter 2 (a disjoint set of their own fares tied to their own vehicle —
+confirmed no overlap with commuter 1's transaction ids), and `GET
+/owner/ledger` as a freshly-registered owner with zero activity — confirmed
+the raw response body is the literal bytes `{"entries":[],...}`, not
+`{"entries":null,...}`.

@@ -147,7 +147,7 @@ func (s *VehicleStateStore) ListByRoute(routeID uuid.UUID) []VehicleState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var result []VehicleState
+	result := []VehicleState{}
 	for _, state := range s.vehicles {
 		if state.RouteID == routeID {
 			result = append(result, state)
