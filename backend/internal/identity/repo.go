@@ -159,6 +159,97 @@ func (r *Repo) CreateVehicle(ctx context.Context, ownerUserID uuid.UUID, registr
 	return v, nil
 }
 
+// ListVehiclesByOwnerUserID returns every vehicle owned by ownerUserID,
+// ordered by registration. Used by the Stage 8 owner-analytics read paths —
+// a plain scoped list query, no aggregation.
+func (r *Repo) ListVehiclesByOwnerUserID(ctx context.Context, ownerUserID uuid.UUID) ([]Vehicle, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT id, owner_user_id, registration, capacity, association_name, compliance_status, created_at, updated_at
+		 FROM vehicles WHERE owner_user_id = $1 ORDER BY registration`,
+		ownerUserID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var vehicles []Vehicle
+	for rows.Next() {
+		var v Vehicle
+		if err := rows.Scan(&v.ID, &v.OwnerUserID, &v.Registration, &v.Capacity, &v.AssociationName, &v.ComplianceStatus, &v.CreatedAt, &v.UpdatedAt); err != nil {
+			return nil, err
+		}
+		vehicles = append(vehicles, v)
+	}
+	return vehicles, rows.Err()
+}
+
+// GetActiveAssignmentByVehicleID returns a vehicle's current active driver
+// assignment, the mirror of GetActiveVehicleAssignmentByDriverID keyed the
+// other direction. There is at most one, enforced by the partial unique
+// index on vehicle_assignments (vehicle_id WHERE active).
+func (r *Repo) GetActiveAssignmentByVehicleID(ctx context.Context, vehicleID uuid.UUID) (VehicleAssignment, error) {
+	var a VehicleAssignment
+	err := r.pool.QueryRow(ctx,
+		`SELECT id, vehicle_id, driver_id, active, created_at, updated_at
+		 FROM vehicle_assignments WHERE vehicle_id = $1 AND active = true`,
+		vehicleID,
+	).Scan(&a.ID, &a.VehicleID, &a.DriverID, &a.Active, &a.CreatedAt, &a.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return VehicleAssignment{}, ErrNotFound
+		}
+		return VehicleAssignment{}, err
+	}
+	return a, nil
+}
+
+// GetDriverByID looks up a driver profile by its own id (as opposed to
+// GetDriverByUserID, keyed by the underlying user account).
+func (r *Repo) GetDriverByID(ctx context.Context, id uuid.UUID) (Driver, error) {
+	var d Driver
+	err := r.pool.QueryRow(ctx,
+		`SELECT id, user_id, full_name, prdp_number, prdp_verified, id_number, kyc_status, created_at, updated_at
+		 FROM drivers WHERE id = $1`,
+		id,
+	).Scan(&d.ID, &d.UserID, &d.FullName, &d.PRDPNumber, &d.PRDPVerified, &d.IDNumber, &d.KYCStatus, &d.CreatedAt, &d.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return Driver{}, ErrNotFound
+		}
+		return Driver{}, err
+	}
+	return d, nil
+}
+
+// ListDriversByOwnerUserID returns every driver currently actively assigned
+// to one of ownerUserID's vehicles, ordered by full name.
+func (r *Repo) ListDriversByOwnerUserID(ctx context.Context, ownerUserID uuid.UUID) ([]Driver, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT d.id, d.user_id, d.full_name, d.prdp_number, d.prdp_verified, d.id_number, d.kyc_status, d.created_at, d.updated_at
+		 FROM drivers d
+		 JOIN vehicle_assignments va ON va.driver_id = d.id AND va.active
+		 JOIN vehicles v ON v.id = va.vehicle_id
+		 WHERE v.owner_user_id = $1
+		 ORDER BY d.full_name`,
+		ownerUserID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var drivers []Driver
+	for rows.Next() {
+		var d Driver
+		if err := rows.Scan(&d.ID, &d.UserID, &d.FullName, &d.PRDPNumber, &d.PRDPVerified, &d.IDNumber, &d.KYCStatus, &d.CreatedAt, &d.UpdatedAt); err != nil {
+			return nil, err
+		}
+		drivers = append(drivers, d)
+	}
+	return drivers, rows.Err()
+}
+
 // GetActiveVehicleAssignmentByDriverID returns the driver's current active
 // vehicle assignment. There is at most one, enforced by the partial unique
 // index on vehicle_assignments (driver_id WHERE active).

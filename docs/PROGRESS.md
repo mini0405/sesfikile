@@ -1192,3 +1192,264 @@ Invoke-RestMethod -Method Get "http://localhost:8080/fuel/vehicle/quota?vehicle_
 ```
 
 Next: Stage 8 — owner dashboard
+
+---
+
+## Stage 8 — owner analytics (backend only) — DONE (2026-07-14)
+
+Read-side aggregation only: no new money mechanics, no crypto, no new
+persistence for money. Built entirely on Stage 1 (identity/auth), Stage 2
+(ledger), Stage 3 (routing), Stage 4 (telemetry), Stage 5 (boarding), and
+Stage 7 (fuel) — earlier code was only touched to add read routes/read-only
+query helpers.
+
+**CORE PRINCIPLE — reconciliation, enforced structurally and by test:** every
+monetary figure returned by `internal/analytics` is a live `SUM()` over
+`ledger_postings` (joined to `ledger_transactions`/`accounts`), never a
+separate counter or cached tally — the same derivation every prior stage
+already uses for a balance. Trip/passenger counts are `COUNT(DISTINCT
+ledger_transactions.id)` over real `kind='fare'` transactions, not an
+incremented counter anywhere. There is exactly one source of truth: the
+ledger. The one documented exception is **fuel consumed**: Stage 7
+deliberately keeps quota consumption OFF the ledger (funding a quota,
+authorizing, and confirming a pump session post **zero** new
+`ledger_postings` rows — its anti-bypass property). Consumption therefore
+cannot be ledger-derived by construction; it's read from
+`fuel_authorizations` (`status='confirmed'`), Stage 7's own real settlement
+record. This is called out in `internal/analytics/models.go`'s package doc
+comment, and revenue/fuel-allocated figures next to it stay ledger-derived
+exactly like everything else.
+
+Built:
+- `backend/internal/analytics/` — the new analytics module:
+  - `models.go` — response DTOs (`Summary`, `VehicleStat`, `DriverStat`,
+    `RevenueVsFuel`/`RevenueVsFuelDay`, `LedgerEntry`/`LedgerPage`) plus the
+    package doc comment carrying the reconciliation principle and SCOPE
+    HONESTY (below) up front.
+  - `daterange.go` — `parseDateRange(r)`, the one documented "today"/range
+    boundary the brief requires. Anchored to a **fixed `Africa/Johannesburg`
+    timezone** (`time.LoadLocation`, with a blank `_ "time/tzdata"` import so
+    it resolves even on a dev machine with no system IANA tz database
+    installed — this Windows box has none by default). `?from=`/`?to=`
+    accept either `YYYY-MM-DD` (interpreted as midnight in that zone; for
+    `to` specifically, bumped to midnight of the *next* day so a plain date
+    includes that whole day) or a full RFC3339 timestamp used as-is. Missing
+    `from` defaults to the start of today; missing `to` defaults to now —
+    together the no-params default is exactly "today so far."
+  - `repo.go` — every aggregation as SQL (`GROUP BY`, `SUM`, `COUNT`), not
+    loaded-then-summed-in-Go, per the brief's performance guidance:
+    `Summary` (owner_revenue/platform_fee/driver_earnings totals for the
+    range + the CURRENT, non-range-bound fuel_account balance via
+    `fuel.Repo.Balance` + range-bound fuel-allocated), `VehicleStatsForOwner`
+    / `DriverStatsForOwner` (one grouped query each, keyed by the
+    `vehicle_id`/`driver_user_id` every fare transaction's `metadata` already
+    carries from Stage 2's `ChargeFare` — answers every vehicle's/driver's
+    stats in one query instead of one query per vehicle/driver), three daily
+    `date_trunc`-bucketed series queries for revenue-vs-fuel, and `Ledger`, a
+    single `UNION ALL` CTE across fare/allocation/authorization sources with
+    `ORDER BY ... LIMIT/OFFSET` done in SQL (plus a matching `COUNT(*)` query
+    for the pagination total).
+  - `handlers.go` — `Summary`, `Vehicles`, `Drivers`, `RevenueVsFuel`,
+    `Ledger`. Every handler resolves the owner strictly from
+    `identity.ClaimsFromContext` (the validated JWT), never from a request
+    parameter — this is what makes cross-owner access structurally
+    impossible rather than merely filtered client-side (see Scoping below).
+- `backend/internal/identity/repo.go` — added the read-only list/lookup
+  helpers this stage needed and Stage 1 never did:
+  `ListVehiclesByOwnerUserID`, `GetActiveAssignmentByVehicleID` (the
+  vehicle-keyed mirror of the existing driver-keyed
+  `GetActiveVehicleAssignmentByDriverID`), `GetDriverByID`, and
+  `ListDriversByOwnerUserID` (join `drivers` ⋈ active `vehicle_assignments`
+  ⋈ `vehicles` on `owner_user_id`). No schema changes — pure additive query
+  helpers over Stage 1's existing tables.
+- `backend/internal/server/router.go`, `backend/cmd/server/main.go` — wired
+  `analytics.NewRepo`/`analytics.NewHandlers` in; `NewRouter` gained an
+  `analyticsHandlers` parameter (`health_test.go` updated to match, same
+  pattern as every prior stage). Routes, all in the existing owner-only
+  group (`identity.RequireAuth` + `identity.RequireRole(RoleOwner)`,
+  established in Stage 7):
+  - `GET /owner/summary`, `GET /owner/vehicles`, `GET /owner/drivers`,
+    `GET /owner/revenue-vs-fuel`, `GET /owner/ledger` — all accept
+    `?from=&to=`; `/owner/ledger` additionally accepts `?limit=&offset=`
+    (default 50, capped at 200).
+
+SCOPE HONESTY (per CLAUDE.md and the stage brief), stated in
+`internal/analytics/models.go`'s package doc comment:
+- No persisted historical snapshots or GPS tracks. Monetary/trip figures are
+  computed live from timestamped ledger postings, so they're accurate for
+  *any* date range. Live fleet status (`online`, `current_route_*`,
+  `seats_available` in `/owner/vehicles`) reflects Stage 4's CURRENT
+  in-memory `VehicleStateStore` — right now, not a recorded timeline. A
+  vehicle that was online an hour ago but has since disconnected shows
+  offline; there's no history log to answer "was it online at 3pm."
+- "Today"/date bounds use one fixed documented timezone
+  (`Africa/Johannesburg`) for the whole MVP, not per-owner/per-request
+  timezone handling.
+
+Decisions / deviations from the original plan:
+- **Passenger volume equals trip count** in this MVP (`passenger_volume` in
+  `Summary` is literally the same number as `trips`) — one fare charge is one
+  commuter boarding one vehicle once (Stage 2/5's model has no multi-seat
+  single fare concept), so there's no independent passenger-count signal to
+  report. Reported as its own field anyway (rather than omitted) since the
+  brief asked for it explicitly and a future multi-passenger fare model would
+  give it a genuinely different value.
+- **Per-vehicle/per-driver attribution reads the `vehicle_id`/
+  `driver_user_id`/`owner_user_id` already embedded in each fare
+  transaction's `metadata` jsonb** (written once, at charge time, by Stage
+  2's `ChargeFare` — not something this stage added). This is *not* a
+  deviation from "derive from the ledger": the money figures still come from
+  `SUM(ledger_postings.amount_cents)`; metadata is only used to know *which*
+  vehicle/driver/owner a given already-ledger-verified posting belongs to.
+  Ownership-based scoping (see below) does NOT rely on this metadata for
+  security — it filters by the owning `accounts.owner_user_id` column
+  wherever an account is owner-owned (`owner_revenue`, `fuel_account`), which
+  cannot be forged by a client. `driver_earnings` accounts belong to the
+  driver, not the owner, so those *are* scoped via
+  `metadata->>'owner_user_id'` (set server-side by `ChargeFare`, never
+  client-supplied) — the driver-earnings query in `repo.go` documents this
+  distinction inline.
+- **`/owner/ledger`'s three-source `UNION ALL` is one CTE query with SQL-side
+  `LIMIT`/`OFFSET`**, not three separate queries merged/paginated in Go —
+  chosen for the brief's "write aggregations as SQL where sensible"
+  guidance; a second matching `COUNT(*)` query supplies the pagination
+  total (demo-scale, acceptable to run twice rather than adding a window
+  function).
+- **`GET /owner/vehicles`/`GET /owner/drivers` still do a handful of
+  per-row lookups in Go** (driver name for a vehicle's assignment, telemetry
+  state, fuel quota) rather than one giant join — the seeded/demo fleet size
+  is small (Stage 1/7 precedent: "small dataset, just loop"), and the *money*
+  aggregation (the part performance actually matters for) is the one part
+  done as grouped SQL (`VehicleStatsForOwner`/`DriverStatsForOwner`).
+
+Tests (`backend/internal/analytics/analytics_test.go`, against a real
+Postgres, skips like every prior stage's integration tests if none is
+reachable, driven through the real HTTP handlers behind
+`identity.RequireAuth`+`RequireRole(RoleOwner)` with real bearer tokens):
+- `TestReconciliation_SummaryMatchesLedgerSums` — the stage's core property:
+  charges three fares + one fuel allocation, then asserts `/owner/summary`'s
+  `revenue_cents`/`trips`/`fuel_balance_cents` exactly equal SUM/COUNT
+  queries computed **independently** in the test (not by calling the same
+  repo code the handler uses) — no figure drifts from the ledger.
+- `TestSplitConsistency_PlatformDriverOwnerSumToFareTotal` — the brief's
+  explicit second property: `revenue_cents + platform_fees_cents +
+  driver_earnings_cents` for the range equals the total fares charged,
+  matching Stage 2's fare split exactly.
+- `TestScoping_OwnerCannotSeeAnotherOwnersData` — two owners, each with their
+  own vehicle/driver/fare: asserts owner1's `/owner/summary` revenue is
+  exactly their own fare's owner share (not owner2's), and that
+  `/owner/vehicles`, `/owner/drivers`, `/owner/ledger` for owner1 never
+  contain owner2's vehicle/driver ids.
+- `TestDateRange_RespectsFromTo` — a fare charged "now" is invisible to a
+  `?from=&to=` window five days in the future (zero revenue/trips) and
+  visible in a window covering today.
+- `TestEmptyState_NoActivityReturnsCleanZeros` — a freshly-registered owner
+  with no vehicles/fares/fuel activity gets `200` with every figure `0` and
+  every list empty, not an error.
+
+Verified: `go build ./...`, `go vet ./...`, `gofmt -l .`, and `go mod tidy`
+all clean (no `go.mod`/`go.sum` changes — analytics needed no new
+dependencies). Full test suite (`go test ./...`), including the new
+analytics tests, passes against a live Postgres, and `go test -race ./...`
+(MSYS2 `ucrt64` gcc toolchain, same as Stages 4-7) passes cleanly across
+every package with **no data races detected** and no regressions in any
+prior stage's tests. End-to-end verified by hand against the seeded dev
+data — see the PowerShell walkthrough below (seed → charge fares across both
+seeded vehicles → allocate fuel → all five `/owner/*` endpoints as the
+seeded owner → registered a second owner and confirmed they see clean empty
+data, not the first owner's).
+
+### PowerShell walkthrough
+
+Assumes the Docker Postgres is running and `cmd/server`/`cmd/seed` use the
+default `localhost:5432` (stop the native Windows Postgres service first if
+it's shadowing that port — see CLAUDE.md Stage 0 note). Run from `backend/`.
+
+```powershell
+# 1. Seed dev data (idempotent) and start the server in another terminal.
+go run ./cmd/seed
+go run ./cmd/server
+```
+
+```powershell
+# 2. In a second terminal: log in as the seeded owner and both drivers, and
+#    charge a few fares across BOTH seeded vehicles so /owner/vehicles and
+#    /owner/drivers each have two rows to show. Substitute ids cmd/seed
+#    printed if they differ from a prior run.
+
+$ownerLogin = Invoke-RestMethod -Method Post http://localhost:8080/auth/login `
+  -ContentType "application/json" -Body '{"phone":"+27820000001","password":"Owner123!"}'
+$ownerToken = $ownerLogin.token
+
+$driver1Login = Invoke-RestMethod -Method Post http://localhost:8080/auth/login `
+  -ContentType "application/json" -Body '{"phone":"+27820000002","password":"Driver123!"}'
+$driver1Token = $driver1Login.token
+
+$driver2Login = Invoke-RestMethod -Method Post http://localhost:8080/auth/login `
+  -ContentType "application/json" -Body '{"phone":"+27820000003","password":"Driver123!"}'
+$driver2Token = $driver2Login.token
+
+$commuter1 = (Invoke-RestMethod -Method Post http://localhost:8080/auth/login `
+  -ContentType "application/json" -Body '{"phone":"+27820000004","password":"Commuter123!"}').user_id
+$commuter2 = (Invoke-RestMethod -Method Post http://localhost:8080/auth/login `
+  -ContentType "application/json" -Body '{"phone":"+27820000005","password":"Commuter123!"}').user_id
+
+# vehicleId1 = CA123456's id, vehicleId2 = CA654321's id, both printed by cmd/seed
+$vehicleId1 = "<paste CA123456's id from cmd/seed output>"
+$vehicleId2 = "<paste CA654321's id from cmd/seed output>"
+
+Invoke-RestMethod -Method Post http://localhost:8080/fare/charge `
+  -Headers @{Authorization = "Bearer $driver1Token"} -ContentType "application/json" `
+  -Body (@{commuter_id=$commuter1; vehicle_id=$vehicleId1; fare_cents=3500; idempotency_key=[guid]::NewGuid().ToString()} | ConvertTo-Json)
+Invoke-RestMethod -Method Post http://localhost:8080/fare/charge `
+  -Headers @{Authorization = "Bearer $driver1Token"} -ContentType "application/json" `
+  -Body (@{commuter_id=$commuter1; vehicle_id=$vehicleId1; fare_cents=1200; idempotency_key=[guid]::NewGuid().ToString()} | ConvertTo-Json)
+Invoke-RestMethod -Method Post http://localhost:8080/fare/charge `
+  -Headers @{Authorization = "Bearer $driver2Token"} -ContentType "application/json" `
+  -Body (@{commuter_id=$commuter2; vehicle_id=$vehicleId2; fare_cents=900; idempotency_key=[guid]::NewGuid().ToString()} | ConvertTo-Json)
+```
+
+```powershell
+# 3. Owner withholds fuel from revenue (Stage 7), so the summary/revenue-vs-
+#    fuel figures below have something non-zero to show on the fuel side.
+Invoke-RestMethod -Method Post http://localhost:8080/fuel/allocate `
+  -Headers @{Authorization = "Bearer $ownerToken"}
+```
+
+```powershell
+# 4. Call every Stage 8 endpoint as the owner.
+Invoke-RestMethod -Method Get http://localhost:8080/owner/summary `
+  -Headers @{Authorization = "Bearer $ownerToken"}
+Invoke-RestMethod -Method Get http://localhost:8080/owner/vehicles `
+  -Headers @{Authorization = "Bearer $ownerToken"}
+Invoke-RestMethod -Method Get http://localhost:8080/owner/drivers `
+  -Headers @{Authorization = "Bearer $ownerToken"}
+Invoke-RestMethod -Method Get http://localhost:8080/owner/revenue-vs-fuel `
+  -Headers @{Authorization = "Bearer $ownerToken"}
+Invoke-RestMethod -Method Get http://localhost:8080/owner/ledger `
+  -Headers @{Authorization = "Bearer $ownerToken"}
+```
+
+```powershell
+# 5. Register and log in as a SECOND, unrelated owner and confirm they see
+#    only their own (empty) data — not the first owner's.
+Invoke-RestMethod -Method Post http://localhost:8080/auth/register `
+  -ContentType "application/json" -Body '{"phone":"+27820099999","password":"Owner2Pass!","role":"owner"}'
+$owner2Login = Invoke-RestMethod -Method Post http://localhost:8080/auth/login `
+  -ContentType "application/json" -Body '{"phone":"+27820099999","password":"Owner2Pass!"}'
+$owner2Token = $owner2Login.token
+
+Invoke-RestMethod -Method Get http://localhost:8080/owner/summary `
+  -Headers @{Authorization = "Bearer $owner2Token"}
+# -> every figure 0, not an error
+
+Invoke-RestMethod -Method Get http://localhost:8080/owner/vehicles `
+  -Headers @{Authorization = "Bearer $owner2Token"}
+# -> {"vehicles": []} — NOT owner 1's CA123456/CA654321
+
+Invoke-RestMethod -Method Get http://localhost:8080/owner/ledger `
+  -Headers @{Authorization = "Bearer $owner2Token"}
+# -> {"entries": null, "total": 0, ...} — NOT owner 1's fare/allocation history
+```
+
+Next: Stage 9 — frontends (commuter, driver, owner apps)

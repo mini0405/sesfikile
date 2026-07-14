@@ -4,6 +4,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 
+	"sesfikile/backend/internal/analytics"
 	"sesfikile/backend/internal/boarding"
 	"sesfikile/backend/internal/fuel"
 	"sesfikile/backend/internal/identity"
@@ -13,7 +14,7 @@ import (
 	"sesfikile/backend/internal/wallet"
 )
 
-func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identity.TokenIssuer, walletHandlers *wallet.Handlers, routingHandlers *routing.Handlers, telemetryHandlers *telemetry.Handlers, boardingHandlers *boarding.Handlers, stopsHandlers *stops.Handlers, fuelHandlers *fuel.Handlers) chi.Router {
+func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identity.TokenIssuer, walletHandlers *wallet.Handlers, routingHandlers *routing.Handlers, telemetryHandlers *telemetry.Handlers, boardingHandlers *boarding.Handlers, stopsHandlers *stops.Handlers, fuelHandlers *fuel.Handlers, analyticsHandlers *analytics.Handlers) chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -69,6 +70,12 @@ func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identi
 			r.Get("/fuel/balance", fuelHandlers.Balance)
 			r.Post("/fuel/vehicle/quota", fuelHandlers.FundVehicleQuota)
 			r.Get("/fuel/vehicle/quota", fuelHandlers.VehicleQuota)
+
+			r.Get("/owner/summary", analyticsHandlers.Summary)
+			r.Get("/owner/vehicles", analyticsHandlers.Vehicles)
+			r.Get("/owner/drivers", analyticsHandlers.Drivers)
+			r.Get("/owner/revenue-vs-fuel", analyticsHandlers.RevenueVsFuel)
+			r.Get("/owner/ledger", analyticsHandlers.Ledger)
 		})
 	})
 

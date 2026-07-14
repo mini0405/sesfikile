@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"sesfikile/backend/internal/analytics"
 	"sesfikile/backend/internal/boarding"
 	"sesfikile/backend/internal/config"
 	"sesfikile/backend/internal/db"
@@ -69,7 +70,10 @@ func main() {
 	fuelRepo := fuel.NewRepo(database.Pool, walletRepo)
 	fuelHandlers := fuel.NewHandlers(fuelRepo, cfg.FuelWithholdPct, cfg.FuelPricePerLitreCents)
 
-	router := server.NewRouter(database, identityHandlers, tokens, walletHandlers, routingHandlers, telemetryHandlers, boardingHandlers, stopsHandlers, fuelHandlers)
+	analyticsRepo := analytics.NewRepo(database.Pool, walletRepo, fuelRepo)
+	analyticsHandlers := analytics.NewHandlers(analyticsRepo, identityRepo, routingRepo, fuelRepo, telemetryStore)
+
+	router := server.NewRouter(database, identityHandlers, tokens, walletHandlers, routingHandlers, telemetryHandlers, boardingHandlers, stopsHandlers, fuelHandlers, analyticsHandlers)
 
 	httpServer := &http.Server{
 		Addr:    ":" + cfg.Port,

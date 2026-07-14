@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"sesfikile/backend/internal/analytics"
 	"sesfikile/backend/internal/boarding"
 	"sesfikile/backend/internal/config"
 	"sesfikile/backend/internal/fuel"
@@ -42,8 +43,10 @@ func testRouter(pinger Pinger) chi.Router {
 	telemetryHandlers := telemetry.NewHandlers(telemetryStore, telemetryHub, driverAlerts, identityRepo, routingRepo, tokens)
 	boardingHandlers := boarding.NewHandlers(routingRepo, wallet.NewRepo(nil), identityRepo, telemetryStore, telemetryHub, boarding.NewSigner("test-boarding-secret"), 3*time.Minute, config.FareSplit{PlatformPct: 10, DriverPct: 25, OwnerPct: 65})
 	stopsHandlers := stops.NewHandlers(stops.NewStore(), routingRepo, telemetryStore, driverAlerts, identityRepo)
-	fuelHandlers := fuel.NewHandlers(fuel.NewRepo(nil, wallet.NewRepo(nil)), 30, 2200)
-	return NewRouter(pinger, handlers, tokens, walletHandlers, routingHandlers, telemetryHandlers, boardingHandlers, stopsHandlers, fuelHandlers)
+	fuelRepo := fuel.NewRepo(nil, wallet.NewRepo(nil))
+	fuelHandlers := fuel.NewHandlers(fuelRepo, 30, 2200)
+	analyticsHandlers := analytics.NewHandlers(analytics.NewRepo(nil, wallet.NewRepo(nil), fuelRepo), identityRepo, routingRepo, fuelRepo, telemetryStore)
+	return NewRouter(pinger, handlers, tokens, walletHandlers, routingHandlers, telemetryHandlers, boardingHandlers, stopsHandlers, fuelHandlers, analyticsHandlers)
 }
 
 func TestHealthHandler_Healthy(t *testing.T) {
