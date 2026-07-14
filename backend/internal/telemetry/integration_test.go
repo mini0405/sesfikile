@@ -24,7 +24,7 @@ import (
 // This test requires a reachable Postgres (see infra/docker-compose.yml).
 // It skips rather than failing when no database is available, matching
 // every other DB-backed test in this repo (Stage 0-3).
-func setupTelemetryTest(t *testing.T) (*identity.Repo, *routing.Repo, identity.TokenIssuer, *httptest.Server) {
+func setupTelemetryTest(t *testing.T) (*pgxpool.Pool, *identity.Repo, *routing.Repo, identity.TokenIssuer, *httptest.Server) {
 	t.Helper()
 
 	databaseURL := os.Getenv("DATABASE_URL")
@@ -62,7 +62,7 @@ func setupTelemetryTest(t *testing.T) (*identity.Repo, *routing.Repo, identity.T
 	server := httptest.NewServer(r)
 	t.Cleanup(server.Close)
 
-	return identityRepo, routingRepo, tokens, server
+	return pool, identityRepo, routingRepo, tokens, server
 }
 
 // uniqueSuffix keeps fixtures collision-free across repeat runs against a
@@ -81,7 +81,7 @@ type driverFixture struct {
 // seedDriverOnRoute creates a route, a driver, a vehicle (given capacity),
 // an active assignment between them, and returns a driver JWT plus the
 // created ids.
-func seedDriverOnRoute(t *testing.T, identityRepo *identity.Repo, routingRepo *routing.Repo, tokens identity.TokenIssuer, capacity int) driverFixture {
+func seedDriverOnRoute(t *testing.T, pool *pgxpool.Pool, identityRepo *identity.Repo, routingRepo *routing.Repo, tokens identity.TokenIssuer, capacity int) driverFixture {
 	t.Helper()
 	ctx := context.Background()
 	suffix := uniqueSuffix()
@@ -101,6 +101,18 @@ func seedDriverOnRoute(t *testing.T, identityRepo *identity.Repo, routingRepo *r
 	if _, err := routingRepo.CreateRouteLeg(ctx, route.ID, fromStop.ID, toStop.ID, 1, 1000); err != nil {
 		t.Fatalf("failed to create route leg: %v", err)
 	}
+
+	// This is a shared dev database (not a disposable per-test one), so
+	// clean up the fixture rows this test created rather than leaving them
+	// to pollute cmd/seed's SEEDED DATA output and GET /routes, /stops —
+	// same reasoning and shape as routing/integration_test.go's
+	// seedTestRoutes.
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM route_legs WHERE route_id = $1`, route.ID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM routes WHERE id = $1`, route.ID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM stops WHERE id IN ($1, $2)`, fromStop.ID, toStop.ID)
+	})
 
 	ownerUser, err := identityRepo.CreateUser(ctx, "+27"+suffix+"1", nil, "x", identity.RoleOwner)
 	if err != nil {
@@ -173,13 +185,16 @@ func expectNoEvent(t *testing.T, conn *websocket.Conn, timeout time.Duration) {
 // route sees it in the snapshot then receives position/seat updates, and a
 // commuter subscribed to a different route sees none of it.
 func TestDriverUpdatePropagatesToCommuterOnSameRoute(t *testing.T) {
-	identityRepo, routingRepo, tokens, server := setupTelemetryTest(t)
-	fx := seedDriverOnRoute(t, identityRepo, routingRepo, tokens, 4)
+	pool, identityRepo, routingRepo, tokens, server := setupTelemetryTest(t)
+	fx := seedDriverOnRoute(t, pool, identityRepo, routingRepo, tokens, 4)
 
 	otherRoute, err := routingRepo.CreateRoute(context.Background(), "Telemetry Other Route "+uniqueSuffix(), "Test Association")
 	if err != nil {
 		t.Fatalf("failed to create other route: %v", err)
 	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM routes WHERE id = $1`, otherRoute.ID)
+	})
 
 	commuterSame := dialCommuter(t, server, fx.RouteID)
 	defer commuterSame.Close()
@@ -267,7 +282,7 @@ func TestDriverUpdatePropagatesToCommuterOnSameRoute(t *testing.T) {
 // TestDriverWSRejectsWrongRole confirms a commuter JWT cannot open the
 // driver WS.
 func TestDriverWSRejectsWrongRole(t *testing.T) {
-	identityRepo, _, tokens, server := setupTelemetryTest(t)
+	_, identityRepo, _, tokens, server := setupTelemetryTest(t)
 	ctx := context.Background()
 	suffix := uniqueSuffix()
 

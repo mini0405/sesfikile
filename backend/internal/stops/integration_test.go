@@ -29,6 +29,7 @@ import (
 // skips rather than failing when no database is available, matching every
 // other DB-backed test in this repo (Stage 0-5).
 type testEnv struct {
+	pool      *pgxpool.Pool
 	identity  *identity.Repo
 	routing   *routing.Repo
 	telemetry *telemetry.VehicleStateStore
@@ -83,6 +84,7 @@ func setup(t *testing.T) *testEnv {
 	t.Cleanup(server.Close)
 
 	return &testEnv{
+		pool:      pool,
 		identity:  identityRepo,
 		routing:   routingRepo,
 		telemetry: telemetryStore,
@@ -138,6 +140,18 @@ func seedRoute(t *testing.T, env *testEnv) routeFixture {
 	if _, err := env.routing.CreateRouteLeg(ctx, route.ID, mid.ID, dest.ID, 2, 500); err != nil {
 		t.Fatalf("failed to create leg 2: %v", err)
 	}
+
+	// This is a shared dev database (not a disposable per-test one), so
+	// clean up the fixture rows this test created rather than leaving them
+	// to pollute cmd/seed's SEEDED DATA output and GET /routes, /stops —
+	// same reasoning and shape as routing/integration_test.go's
+	// seedTestRoutes.
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		_, _ = env.pool.Exec(cleanupCtx, `DELETE FROM route_legs WHERE route_id = $1`, route.ID)
+		_, _ = env.pool.Exec(cleanupCtx, `DELETE FROM routes WHERE id = $1`, route.ID)
+		_, _ = env.pool.Exec(cleanupCtx, `DELETE FROM stops WHERE id IN ($1, $2, $3)`, origin.ID, mid.ID, dest.ID)
+	})
 
 	return routeFixture{
 		RouteID: route.ID.String(), OriginID: origin.ID.String(), MidID: mid.ID.String(), DestID: dest.ID.String(),

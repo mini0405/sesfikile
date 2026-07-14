@@ -150,6 +150,18 @@ func seedFixture(t *testing.T, env *testEnv, commuterBalanceCents, fareCents int
 		t.Fatalf("failed to create route leg: %v", err)
 	}
 
+	// This is a shared dev database (not a disposable per-test one), so
+	// clean up the fixture rows this test created rather than leaving them
+	// to pollute cmd/seed's SEEDED DATA output and GET /routes, /stops —
+	// same reasoning and shape as routing/integration_test.go's
+	// seedTestRoutes.
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		_, _ = env.pool.Exec(cleanupCtx, `DELETE FROM route_legs WHERE route_id = $1`, route.ID)
+		_, _ = env.pool.Exec(cleanupCtx, `DELETE FROM routes WHERE id = $1`, route.ID)
+		_, _ = env.pool.Exec(cleanupCtx, `DELETE FROM stops WHERE id IN ($1, $2)`, fromStop.ID, toStop.ID)
+	})
+
 	ownerUser, err := env.identity.CreateUser(ctx, "+27"+suffix+"1", nil, "x", identity.RoleOwner)
 	if err != nil {
 		t.Fatalf("failed to create owner: %v", err)

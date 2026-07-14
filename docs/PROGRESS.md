@@ -2201,3 +2201,149 @@ confirmed no overlap with commuter 1's transaction ids), and `GET
 /owner/ledger` as a freshly-registered owner with zero activity — confirmed
 the raw response body is the literal bytes `{"entries":[],...}`, not
 `{"entries":null,...}`.
+
+---
+
+## Housekeeping — test-data isolation + cleanup — DONE (2026-07-14)
+
+No feature changes. The dev Postgres had accumulated hundreds of junk
+routes/stops from DB-backed integration tests that create fixtures against
+the **persistent** dev database (not a disposable one) and, in three of the
+four test files that do this, never cleaned them up. This cluttered `GET
+/routes`, the new `GET /stops` (previous entry), and `cmd/seed`'s SEEDED
+DATA summary. Two parts: stop the leak at the root, then clean up what had
+already accumulated.
+
+**Root cause, confirmed by querying the live dev DB (not guessed)**: a
+`GROUP BY name` over `routes` showed exactly four junk-producing patterns —
+`Boarding Test Route %` (96 rows), `Stops Test Route %` (54), `Telemetry
+Other Route %` (12), `Telemetry Test Route %` (12) — and the matching stop
+patterns `Boarding Test Origin/Dest %`, `Stops Test Origin/Mid/Dest %`,
+`Telemetry Test Origin/Dest %` (378 stops total). Tracing each pattern to
+its source:
+  - `internal/routing/integration_test.go`'s `seedTestRoutes` **already**
+    cleans up via `t.Cleanup` (Stage 3's original test-hygiene pass) — 0
+    leftover rows from this file, confirming the pattern works when applied.
+  - `internal/boarding/boarding_test.go`'s `seedFixture`,
+    `internal/stops/integration_test.go`'s `seedRoute`, and
+    `internal/telemetry/integration_test.go`'s `seedDriverOnRoute` (plus one
+    inline `CreateRoute` call in `TestDriverUpdatePropagatesToCommuterOnSameRoute`
+    for a second "other route") created stops/routes/legs with the same
+    unique-per-call-timestamp naming discipline as every other DB-backed
+    test in this repo, but **never removed them** — these three files are
+    where all 174 junk routes / 378 junk stops came from.
+
+**Fix chosen: (a) `t.Cleanup` in each fixture helper, matching the pattern
+`routing/integration_test.go` already established** — not (b) a separate
+"removable" naming convention (redundant; the names were already
+unique/removable, just never removed) and not (c) transaction-rollback
+isolation (would require restructuring every DB-backed test in the repo to
+run inside one enclosing transaction shared with the handler-under-test's
+own pool — a much bigger change than this housekeeping pass warrants, and
+several of these tests exercise real HTTP/WebSocket servers backed by the
+same pool, where a single outer transaction doesn't compose cleanly with
+concurrent request handling). `t.Cleanup` deleting exactly the rows a test
+created (by id, not by re-matching a name pattern) is the smallest change
+that fixes the leak without touching what any test asserts:
+  - `internal/boarding/boarding_test.go` — `seedFixture` now deletes its
+    route's legs, the route, and its two stops in `t.Cleanup` (reusing the
+    existing `env.pool` field already on `testEnv`).
+  - `internal/stops/integration_test.go` — `testEnv` gained a `pool` field
+    (previously private to `setup`, not stored); `seedRoute` now deletes its
+    route's legs, the route, and its three stops (origin/mid/dest) in
+    `t.Cleanup`.
+  - `internal/telemetry/integration_test.go` — `setupTelemetryTest` now
+    also returns the pool (signature grew from 4 to 5 return values; both
+    call sites updated); `seedDriverOnRoute` now deletes its route's leg,
+    the route, and its two stops in `t.Cleanup`;
+    `TestDriverUpdatePropagatesToCommuterOnSameRoute`'s extra "other route"
+    (created inline, not through `seedDriverOnRoute`) gets its own
+    `t.Cleanup` too.
+  - Deliberately **not** cleaning up the users/vehicles/drivers/commuters
+    these same fixtures create — out of scope for this pass, which is about
+    the routes/stops clutter specifically named in the brief; those rows
+    don't show up in `GET /routes`, `GET /stops`, or the seed summary the
+    way junk routes/stops do.
+  - No test assertions changed anywhere — only when the rows they created
+    get deleted.
+
+**Cleanup tool for already-accumulated junk: `backend/cmd/cleanup`.** A
+small, safe, idempotent Go command rather than a one-off SQL script, so it's
+re-runnable via `go run` like `cmd/seed`/`cmd/cleanup` and shares
+`internal/config`'s `DATABASE_URL` handling instead of hardcoding a DSN:
+  - Matches routes by the exact four `LIKE` patterns identified above (see
+    `routeNamePatterns` in `cmd/cleanup/main.go`) — never a broad wildcard,
+    never touched the real 8 Cape Town corridor routes.
+  - A stop is deleted only if it **both** matches one of the corresponding
+    junk name patterns **and** has zero `route_legs` references left once
+    the junk routes' legs are removed (`NOT EXISTS` against `route_legs`,
+    re-checked inside the same transaction right before the stop `DELETE` —
+    not reused from an earlier read) — so a stop can never be deleted while
+    a real route still uses it, even under a hypothetical future name
+    collision.
+  - Deletion order respects the FK (`route_legs` before `routes`); nothing
+    here touches `ledger_transactions`/`ledger_postings`, so Stage 2's
+    zero-sum trigger is never in play — fare metadata stores `vehicle_id`,
+    not route/stop ids, so routes/stops carry no ledger FK at all.
+  - **Defaults to a dry run**: always prints the matched route count (with a
+    sample, capped at 20 + "...and N more") and the stop count that would
+    become orphaned, before doing anything. Pass `-apply` to actually
+    delete; a bare run makes zero writes.
+  - Wrapped in one transaction on `-apply`, so a failure partway through
+    rolls back cleanly rather than leaving routes deleted but their legs
+    not, or vice versa.
+
+Verified end-to-end against the live dev DB: dry run reported exactly 174
+matched routes / 378 orphanable stops (matching the `GROUP BY` counts found
+during investigation); `-apply` deleted 216 `route_legs`, 174 routes, 378
+stops in one transaction; a follow-up dry run reported **0/0** (idempotent —
+nothing left to match); `cmd/seed`'s SEEDED DATA summary now lists only the
+8 real corridors and their 12 real stops, with the same 3 interchanges as
+Stage 3; `GET /routes` and `GET /stops` were spot-checked directly and show
+only real data.
+
+**Regression check — the fix actually stops the leak**: ran the full suite
+twice in a row against the same (not reset) Postgres
+(`go test -count=1 ./...`, then again), and a `go test -race -count=1 ./...`
+pass on top of that — `SELECT count(*) FROM routes` / `stops` stayed at
+exactly 8/12 after every run, and a diff against the real corridor name list
+showed zero rows outside it after each run.
+
+**Aside, found during this verification, NOT fixed here (out of scope,
+flagged rather than silently left)**: `internal/fuel/fuel_test.go`'s
+`TestAntiBypass_FuelFundsNeverReachWalletOrPayout` sums the **entire**
+`commuter_wallet` account type across the whole database (not scoped to the
+one owner/vehicle it creates) and asserts that total is unchanged across its
+own run. Under `go test ./...`'s default cross-package parallelism, other
+packages' tests (`wallet`, `boarding`, `stops`, `analytics`) are
+concurrently topping up/charging real commuter wallets in the same shared
+persistent DB, so this assertion can spuriously fail depending on scheduling
+— reproduced once during this pass's verification, and confirmed to pass
+reliably both alone (`go test ./internal/fuel/...`) and under `go test -p 1
+./...` (packages run sequentially, no cross-package interference). This is a
+pre-existing test-isolation gap unrelated to the routes/stops leak this
+pass fixes (a global-aggregate assertion racing other packages, not
+junk-data accumulation) — noted here for a future pass rather than fixed
+under this housekeeping brief's scope. All verification above used `-p 1` to
+route around it without weakening or skipping the assertion itself.
+
+Verified: `go build ./...`, `go vet ./...`, `gofmt -l .`, and `go mod tidy`
+all clean (no `go.mod`/`go.sum` diff). `go test -count=1 -p 1 ./...` and
+`go test -race -count=1 -p 1 ./...` both pass in full, twice consecutively,
+against the same live Postgres, with zero regressions in any prior stage's
+assertions — only fixture data lifecycle changed, no test logic.
+
+Cleanup / reseed commands (PowerShell):
+
+```powershell
+$env:DATABASE_URL = "postgres://sesfikile:sesfikile_dev@localhost:5432/sesfikile?sslmode=disable"
+
+# Dry run — always do this first, shows exactly what would be deleted
+go run ./cmd/cleanup
+
+# Apply — actually deletes the matched junk routes/legs/stops
+go run ./cmd/cleanup -apply
+
+# Confirm cmd/seed's summary is clean again (only the 8 real corridors)
+go run ./cmd/seed
+```
