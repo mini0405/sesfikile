@@ -15,6 +15,11 @@ const (
 	AccountOwnerRevenue   AccountType = "owner_revenue"
 	AccountPlatformFee    AccountType = "platform_fee"
 	AccountFundingSource  AccountType = "funding_source"
+	// AccountFuelAccount holds money REAL-ledger-withheld from an owner's
+	// revenue for fuel (Stage 7). See internal/fuel — the account type
+	// itself is plain ledger accounting; only the pump/VIU on the far side
+	// of it is mocked.
+	AccountFuelAccount AccountType = "fuel_account"
 )
 
 type TransactionKind string
@@ -22,6 +27,10 @@ type TransactionKind string
 const (
 	KindTopup TransactionKind = "topup"
 	KindFare  TransactionKind = "fare"
+	// KindFuelAllocation is an internal transfer from an owner's
+	// owner_revenue account into their fuel_account (Stage 7) — no money is
+	// created, it only moves between the owner's own accounts.
+	KindFuelAllocation TransactionKind = "fuel_allocation"
 )
 
 // Account. OwnerUserID is nil for the system accounts (platform_fee,

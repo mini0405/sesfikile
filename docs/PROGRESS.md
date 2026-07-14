@@ -906,3 +906,289 @@ receive nothing and the request reports `driver_available: false`. See the
 PowerShell walkthrough below.
 
 Next: Stage 7 — fuel disbursement (mock)
+
+---
+
+## Stage 7 — fuel disbursement (mock) — DONE (2026-07-14)
+
+**SCOPE HONESTY (highest bar of any stage, per CLAUDE.md and the stage
+brief):** there is no real eFuel / FuelOmat / VIU device anywhere in this
+codebase. `backend/internal/fuel/viu_mock.go` carries a file-level doc
+comment saying so explicitly, and every mock type/endpoint is named and
+commented as a simulation of the hardware boundary. The **withholding**
+half of this stage (`Allocate`) is the opposite: it is REAL double-entry
+ledger accounting, reusing Stage 2's `accounts`/`ledger_transactions`/
+`ledger_postings` tables and zero-sum trigger unchanged.
+
+Built:
+- `backend/migrations/000004_fuel_schema.{up,down}.sql`:
+  - `ALTER TYPE account_type ADD VALUE 'fuel_account'` and `ALTER TYPE
+    transaction_kind ADD VALUE 'fuel_allocation'` — additive-only, Stage 2's
+    schema/trigger need no changes. (Down migration cannot drop a single
+    enum value in Postgres without recreating the type; documented as an
+    accepted MVP limitation rather than attempted.)
+  - `vehicle_fuel_quotas` (`vehicle_id` PK, `owner_user_id`, `quota_cents`,
+    `reserved_cents`, `used_cents`) — a **plain table, not a second ledger
+    account per vehicle** (the brief explicitly allows either). Available-
+    to-authorize is always `quota_cents - reserved_cents - used_cents`,
+    enforced by a `CHECK (reserved_cents + used_cents <= quota_cents)`
+    constraint, not just application code.
+  - `fuel_authorizations` (`id`, `vehicle_id`, `litres`, `amount_cents`,
+    `status` enum `reserved`/`confirmed`, `confirmed_at`) — the MOCK VIU's
+    authorize-then-confirm session records; `id` is the `auth_reference` a
+    real device would carry from authorize through to confirm.
+- `backend/internal/wallet/`:
+  - Added `AccountFuelAccount` ("fuel_account") and `KindFuelAllocation`
+    ("fuel_allocation") to the existing `AccountType`/`TransactionKind`
+    enums (`models.go`) — Stage 2's "add a fuel account type (or reuse the
+    account model)" instruction taken literally.
+  - **`Repo.InternalTransfer(ctx, ownerUserID, fromType, toType,
+    amountCents, kind, metadata)`** — new generic primitive, factored out of
+    `ChargeFare`'s lock/read/post pattern: moves money between two accounts
+    owned by the same user as one balanced ledger transaction. This is what
+    `/fuel/allocate` is built on (`owner_revenue -> fuel_account`), reused
+    rather than duplicating the lock-then-balance-check logic a third time.
+- `backend/internal/fuel/` — the new fuel module:
+  - `models.go` — `VehicleQuota` (with `AvailableCents()`), `Authorization`,
+    `AuthorizationStatus`. Package doc comment states the real-vs-mock split
+    up front.
+  - `repo.go` — the REAL-ledger half: `Allocate` (computes `withholdPct%` of
+    the owner's current `owner_revenue` balance and calls
+    `wallet.Repo.InternalTransfer`; errors `ErrNothingToAllocate` if revenue
+    is zero rather than posting a no-op zero-amount transaction),
+    `Balance` (fuel_account ledger balance, same `SUM(postings)` derivation
+    as every other account), `FundVehicleQuota`, `VehicleQuotaFor`. A
+    doc-comment block states the **anti-bypass property** structurally:
+    fuel_account/vehicle-quota money only ever flows
+    `owner_revenue -> fuel_account -> a vehicle's quota -> a MOCK VIU
+    authorization` — there is no function anywhere in the package that
+    posts value from fuel_account/vehicle_fuel_quotas toward
+    commuter_wallet, driver_earnings, owner_revenue, or funding_source.
+  - `viu_mock.go` — the MOCK VIU half, file-level comment says explicitly
+    there is no real device on the other end: `AuthorizePump` (checks the
+    vehicle's available quota under `SELECT ... FOR UPDATE`; if sufficient,
+    inserts a `fuel_authorizations` row with `status='reserved'` and
+    increments `reserved_cents` — a **reservation, not yet a final debit**;
+    if insufficient, denies with a reason and the real available amount,
+    reserving nothing) and `ConfirmPump` (moves `reserved_cents` to
+    `used_cents` and marks the row `confirmed` — the actual settlement; a
+    second confirm of the same `auth_reference` is a no-op, returning
+    `already_confirmed: true` instead of debiting twice). A `TODO` comment
+    on `ConfirmPump` flags that an unconfirmed reservation never expires in
+    this MVP — a real system would need a timeout sweep to release it back
+    to available quota, not implemented here.
+  - `handlers.go` — HTTP surface: `Allocate`, `Balance`, `FundVehicleQuota`,
+    `VehicleQuota` (all owner-only), `AuthorizePump`/`ConfirmPump` (the MOCK
+    VIU endpoints — see routing decision below). `AuthorizePump` accepts
+    **either** `litres` (converted via `pricePerLitreCents`) **or**
+    `amount_cents` directly, documented as "keep it simple, work in cents
+    underneath."
+- `backend/internal/config`:
+  - `FuelWithholdPct` (env `FUEL_WITHHOLD_PCT`, default **30**).
+  - `FuelPricePerLitreCents` (env `FUEL_PRICE_PER_LITRE_CENTS`, default
+    **2200**, i.e. R22.00/litre — a plausible dev-only default, not a live
+    price feed).
+- `backend/internal/server/router.go`, `backend/cmd/server/main.go` — wired
+  `fuel.NewRepo`/`fuel.NewHandlers` in; `NewRouter` gained a `fuelHandlers`
+  parameter (`health_test.go` updated to match, same pattern as every prior
+  stage). Routes:
+  - `POST /fuel/allocate`, `GET /fuel/balance`, `POST /fuel/vehicle/quota`,
+    `GET /fuel/vehicle/quota?vehicle_id=` — all behind
+    `identity.RequireAuth` + `identity.RequireRole(RoleOwner)`, in a new
+    owner-only route group (the first one this router has needed — prior
+    stages' owner endpoints were all `GET /wallet/balance`, which is
+    role-generic).
+  - `POST /fuel/viu/authorize`, `POST /fuel/viu/confirm` — **deliberately
+    public, no auth** (see decision below).
+
+Decisions / deviations from the original plan:
+- **Per-vehicle quota is a plain table (`vehicle_fuel_quotas`), not a
+  second ledger account per vehicle.** The brief explicitly allowed either.
+  Funding a vehicle's quota from the owner's `fuel_account` does **not**
+  post a new ledger transaction — the real money movement already happened
+  in `Allocate` (`owner_revenue -> fuel_account`); earmarking a slice of
+  that already-withheld balance to one vehicle is bookkeeping over money
+  that's already left owner_revenue, not a second cross-account transfer.
+  It's still checked against `fuel_account`'s live ledger balance minus
+  everything already earmarked to other vehicles, so a vehicle's quota can
+  never exceed what the owner actually withheld. Verified directly by
+  `TestAntiBypass_FuelFundsNeverReachWalletOrPayout`, which asserts
+  `FundVehicleQuota`/`AuthorizePump`/`ConfirmPump` add **zero** new
+  `ledger_postings` rows — only `Allocate` ever does.
+- **Authorize reserves, confirm settles** — modeled exactly as two separate
+  states (`reserved_cents` vs `used_cents`) rather than debiting on
+  authorize, mirroring how a real fuel-dispensing device actually works
+  (hold the funds when the nozzle handshakes, settle once fuel actually
+  flows). A second `/fuel/viu/confirm` on the same `auth_reference` is
+  idempotent (not an error) — it reports `already_confirmed: true` and
+  changes nothing, the same "replay-safe" pattern Stage 5's boarding scan
+  and Stage 2's `ChargeFare` already use for their own idempotency keys.
+- **Unconfirmed reservations are never released** in this MVP — flagged as
+  a `TODO` in `viu_mock.go` rather than implemented. A real system would
+  need a background sweep or authorize-TTL to return a stale hold's
+  `reserved_cents` to available quota; out of scope here per the brief's
+  explicit allowance ("a TODO comment is fine for MVP").
+- **`/fuel/viu/authorize` and `/fuel/viu/confirm` require no auth.** Every
+  other endpoint in this stage is owner-only, but these two stand in for a
+  physical device's half of the conversation — a real VIU would
+  authenticate with device-level credentials (a provisioned cert/API key),
+  not a commuter/driver/owner JWT, and modeling that is out of scope for an
+  MVP hardware simulation. Called out explicitly in `router.go` rather than
+  left as an implicit gap.
+- **A denied authorization is `200 {authorized:false, reason, max_amount}`,
+  not an HTTP error status.** A real VIU integration needs to distinguish
+  "the device/request itself was malformed" (4xx) from "the request was
+  valid but the answer is no" (a clean decline) — the same reasoning
+  Stage 6's `stops.RequestStop` already applied to `driver_available:
+  false`.
+- **`AuthorizePump` accepts litres OR amount_cents**, converting via the
+  configured `FuelPricePerLitreCents`, rather than requiring one specific
+  unit — kept simple per the brief ("just work in cents — keep it simple,
+  document units"), documented in the handler's doc comment.
+- `cmd/seed` was **not** modified for this stage — the PowerShell
+  walkthrough below demonstrates the full flow by hand against the existing
+  seeded owner/vehicle/driver/commuter, charging a fresh fare to fund
+  `owner_revenue` rather than needing a new seed step.
+
+Tests (`backend/internal/fuel/fuel_test.go`, against a real Postgres, skips
+like every prior stage's integration tests if none is reachable):
+- `TestAllocate_MovesExactWithholdPercentage` — `/fuel/allocate` withholds
+  exactly `withholdPct%` of `owner_revenue` into `fuel_account`;
+  `owner_revenue` drops by exactly that amount; the transaction's postings
+  sum to zero.
+- `TestAllocate_NothingToAllocateWhenRevenueZero` — zero revenue ->
+  `ErrNothingToAllocate`, no transaction created.
+- `TestFundVehicleQuota_CannotExceedFuelAccountBalance` — funding more than
+  `fuel_account` holds is rejected (`wallet.ErrInsufficientFunds`); funding
+  within it succeeds and is reflected in `quota_cents`/`AvailableCents()`.
+- `TestFundVehicleQuota_RejectsVehicleNotOwnedByCaller` — an owner cannot
+  fund a quota for another owner's vehicle.
+- `TestAuthorizePump_WithinQuota_ReservesAndAuthorizes` — authorize within
+  quota -> `authorized:true`, `reserved_cents` increases by the requested
+  amount, available quota drops accordingly.
+- `TestAuthorizePump_BeyondQuota_DeniedAndQuotaUnchanged` — authorize beyond
+  quota -> `authorized:false` with the real `max_amount_cents`, and the
+  quota row is completely unchanged (no partial reservation).
+- `TestAuthorizePump_NoQuotaAllocated_Denied` — a vehicle with no quota ever
+  funded is cleanly denied, not a 500.
+- `TestConfirmPump_SettlesReservationCorrectly` — confirm moves
+  `reserved_cents` to `used_cents` for exactly the reserved amount.
+- `TestConfirmPump_SecondConfirmIsIdempotent_NoDoubleDebit` — the explicit
+  brief requirement: a second confirm on the same `auth_reference` reports
+  `already_confirmed:true` and `used_cents` does not move a second time.
+- `TestConfirmPump_UnknownReference_NotFound` — confirming a nonexistent
+  reference returns `ErrNotFound`, not a silent success.
+- `TestAntiBypass_FuelFundsNeverReachWalletOrPayout` — runs the full
+  allocate -> fund quota -> authorize -> confirm flow and asserts: (a)
+  `FundVehicleQuota`/`AuthorizePump`/`ConfirmPump` create **zero** new
+  `ledger_postings` rows (only `Allocate` does — confirmed by comparing
+  `ledger_postings` row counts before/after each step), and (b) the total
+  balance across every `commuter_wallet`, `driver_earnings`, and the
+  `funding_source` account is completely unchanged by any fuel operation —
+  the structural proof that fuel value cannot be cashed back out through
+  the ledger.
+
+Verified: `go build ./...`, `go vet ./...`, `gofmt -l .`, and `go mod tidy`
+all clean (no `go.mod`/`go.sum` changes — fuel needed no new dependencies).
+Full test suite (`go test ./...`), including the new fuel unit/integration
+tests, passes against a live Postgres, and `go test -race ./...` (MSYS2
+`ucrt64` gcc toolchain, same as Stages 4-6) passes cleanly across every
+package with **no data races detected** and no regressions in any prior
+stage's tests. End-to-end verified by hand against the seeded dev data —
+see the PowerShell walkthrough below (seed -> charge a fare so
+`owner_revenue` is non-zero -> owner `/fuel/allocate` -> `/fuel/balance` ->
+fund a vehicle's quota -> MOCK VIU authorize within quota -> authorize
+beyond quota, cleanly denied -> confirm -> replayed confirm, idempotent).
+
+### PowerShell walkthrough
+
+Assumes the Docker Postgres is running and `cmd/server`/`cmd/seed` use the
+default `localhost:5432` (stop the native Windows Postgres service first if
+it's shadowing that port — see CLAUDE.md Stage 0 note). Run from
+`backend/`.
+
+```powershell
+# 1. Seed dev data (idempotent) and start the server in another terminal.
+go run ./cmd/seed
+go run ./cmd/server
+```
+
+```powershell
+# 2. In a second terminal: log in as the seeded owner and driver 1, and
+#    charge a couple of fares so owner_revenue is non-zero. Substitute the
+#    vehicle/commuter ids cmd/seed printed for CA123456 / commuter 1 if
+#    they differ from a prior run.
+
+$ownerLogin = Invoke-RestMethod -Method Post http://localhost:8080/auth/login `
+  -ContentType "application/json" -Body '{"phone":"+27820000001","password":"Owner123!"}'
+$ownerToken = $ownerLogin.token
+
+$driverLogin = Invoke-RestMethod -Method Post http://localhost:8080/auth/login `
+  -ContentType "application/json" -Body '{"phone":"+27820000002","password":"Driver123!"}'
+$driverToken = $driverLogin.token
+
+$commuterLogin = Invoke-RestMethod -Method Post http://localhost:8080/auth/login `
+  -ContentType "application/json" -Body '{"phone":"+27820000004","password":"Commuter123!"}'
+$commuterId = $commuterLogin.user_id   # or read from cmd/seed output
+
+# vehicleId = CA123456's id, printed by cmd/seed
+$vehicleId = "<paste CA123456's id from cmd/seed output>"
+
+Invoke-RestMethod -Method Post http://localhost:8080/fare/charge `
+  -Headers @{Authorization = "Bearer $driverToken"} -ContentType "application/json" `
+  -Body (@{commuter_id=$commuterId; vehicle_id=$vehicleId; fare_cents=3500; idempotency_key=[guid]::NewGuid().ToString()} | ConvertTo-Json)
+
+Invoke-RestMethod -Method Get http://localhost:8080/wallet/balance `
+  -Headers @{Authorization = "Bearer $ownerToken"}
+# -> owner_revenue balance should now be non-zero (65% of 3500 = 2275)
+```
+
+```powershell
+# 3. Owner withholds 30% of owner_revenue into fuel_account.
+Invoke-RestMethod -Method Post http://localhost:8080/fuel/allocate `
+  -Headers @{Authorization = "Bearer $ownerToken"}
+# -> {"transaction_id": "...", "allocated_cents": 682, "withhold_pct": 30}
+
+Invoke-RestMethod -Method Get http://localhost:8080/fuel/balance `
+  -Headers @{Authorization = "Bearer $ownerToken"}
+# -> {"balance_cents": 682}
+```
+
+```powershell
+# 4. Owner funds vehicle CA123456's fuel quota from fuel_account.
+Invoke-RestMethod -Method Post http://localhost:8080/fuel/vehicle/quota `
+  -Headers @{Authorization = "Bearer $ownerToken"} -ContentType "application/json" `
+  -Body (@{vehicle_id=$vehicleId; amount_cents=500} | ConvertTo-Json)
+# -> {"vehicle_id": "...", "quota_cents": 500, "reserved_cents": 0, "used_cents": 0, "available_cents": 500}
+```
+
+```powershell
+# 5. MOCK VIU authorizes a pump session WITHIN quota.
+$auth = Invoke-RestMethod -Method Post http://localhost:8080/fuel/viu/authorize `
+  -ContentType "application/json" -Body (@{vehicle_id=$vehicleId; amount_cents=300} | ConvertTo-Json)
+$auth
+# -> {"authorized": true, "auth_reference": "...", "max_amount_cents": 300}
+
+# 6. MOCK VIU authorizes a pump session BEYOND remaining quota (500-300=200 left) — DENIED.
+Invoke-RestMethod -Method Post http://localhost:8080/fuel/viu/authorize `
+  -ContentType "application/json" -Body (@{vehicle_id=$vehicleId; amount_cents=250} | ConvertTo-Json)
+# -> {"authorized": false, "reason": "requested amount exceeds available fuel quota", "max_amount_cents": 200}
+```
+
+```powershell
+# 7. MOCK VIU confirms the first (authorized) pump session.
+Invoke-RestMethod -Method Post http://localhost:8080/fuel/viu/confirm `
+  -ContentType "application/json" -Body (@{auth_reference=$auth.auth_reference} | ConvertTo-Json)
+# -> {"vehicle_id": "...", "amount_cents": 300, "already_confirmed": false}
+
+# Replaying the same confirm is idempotent — no double debit.
+Invoke-RestMethod -Method Post http://localhost:8080/fuel/viu/confirm `
+  -ContentType "application/json" -Body (@{auth_reference=$auth.auth_reference} | ConvertTo-Json)
+# -> {"vehicle_id": "...", "amount_cents": 300, "already_confirmed": true}
+
+Invoke-RestMethod -Method Get "http://localhost:8080/fuel/vehicle/quota?vehicle_id=$vehicleId" `
+  -Headers @{Authorization = "Bearer $ownerToken"}
+# -> {"quota_cents": 500, "reserved_cents": 0, "used_cents": 300, "available_cents": 200}
+```
+
+Next: Stage 8 — owner dashboard

@@ -23,6 +23,12 @@ type Config struct {
 	FareSplit          FareSplit
 	BoardingHMACSecret string
 	BoardingPassTTL    time.Duration
+	// FuelWithholdPct is the percentage of an owner's current owner_revenue
+	// balance that /fuel/allocate moves into their fuel_account (Stage 7).
+	FuelWithholdPct int
+	// FuelPricePerLitreCents converts litres <-> cents for the MOCK VIU
+	// authorize endpoint — a configurable price, not a real fuel-price feed.
+	FuelPricePerLitreCents int64
 }
 
 func Load() Config {
@@ -39,12 +45,24 @@ func Load() Config {
 		// secret, or anyone could forge a valid pass.
 		BoardingHMACSecret: getEnv("BOARDING_HMAC_SECRET", "dev-only-insecure-boarding-secret-change-me"),
 		BoardingPassTTL:    getEnvSeconds("BOARDING_PASS_TTL_SECONDS", 180),
+		FuelWithholdPct:    getEnvInt("FUEL_WITHHOLD_PCT", 30),
+		// R22.00/litre — a plausible dev-only default, not a live price feed.
+		FuelPricePerLitreCents: int64(getEnvInt("FUEL_PRICE_PER_LITRE_CENTS", 2200)),
 	}
 }
 
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
+	}
+	return fallback
+}
+
+func getEnvInt(key string, fallback int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return fallback
 }

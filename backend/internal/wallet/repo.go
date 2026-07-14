@@ -16,6 +16,7 @@ var (
 	ErrInsufficientFunds   = errors.New("insufficient funds")
 	ErrNoActiveDriver      = errors.New("vehicle has no active driver assignment")
 	ErrIdempotencyRequired = errors.New("idempotency_key is required")
+	ErrInvalidAmount       = errors.New("amount_cents must be positive")
 )
 
 // querier is satisfied by both *pgxpool.Pool and pgx.Tx, so repo helpers can
@@ -226,6 +227,68 @@ func (r *Repo) Topup(ctx context.Context, commuterUserID uuid.UUID, amountCents 
 		return LedgerTransaction{}, 0, err
 	}
 	return txn, balance, nil
+}
+
+// InternalTransfer moves amountCents from one account type to another,
+// both owned by the same user, as a single balanced ledger transaction.
+// This is the generic primitive Stage 7's fuel withholding is built on:
+// moving money from an owner's owner_revenue into their fuel_account is an
+// internal transfer between that owner's own accounts, not new money and
+// not a payout, so it reuses the exact same lock/read/post pattern
+// ChargeFare uses rather than introducing a second way to move money.
+func (r *Repo) InternalTransfer(ctx context.Context, ownerUserID uuid.UUID, fromType, toType AccountType, amountCents int64, kind TransactionKind, metadata map[string]any) (LedgerTransaction, error) {
+	if amountCents <= 0 {
+		return LedgerTransaction{}, ErrInvalidAmount
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return LedgerTransaction{}, err
+	}
+	defer tx.Rollback(ctx)
+
+	fromAcc, err := r.GetOrCreateAccount(ctx, tx, &ownerUserID, fromType)
+	if err != nil {
+		return LedgerTransaction{}, err
+	}
+
+	// Lock the source account the same way ChargeFare locks the commuter's
+	// wallet — this is what serializes two concurrent transfers out of the
+	// same account.
+	if err := r.lockAccount(ctx, tx, fromAcc.ID); err != nil {
+		return LedgerTransaction{}, err
+	}
+
+	balance, err := r.AccountBalance(ctx, tx, fromAcc.ID)
+	if err != nil {
+		return LedgerTransaction{}, err
+	}
+	if balance < amountCents {
+		return LedgerTransaction{}, ErrInsufficientFunds
+	}
+
+	toAcc, err := r.GetOrCreateAccount(ctx, tx, &ownerUserID, toType)
+	if err != nil {
+		return LedgerTransaction{}, err
+	}
+
+	txn, err := r.insertTransaction(ctx, tx, kind, nil, metadata)
+	if err != nil {
+		return LedgerTransaction{}, err
+	}
+
+	if err := r.insertPosting(ctx, tx, txn.ID, fromAcc.ID, -amountCents); err != nil {
+		return LedgerTransaction{}, err
+	}
+	if err := r.insertPosting(ctx, tx, txn.ID, toAcc.ID, amountCents); err != nil {
+		return LedgerTransaction{}, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return LedgerTransaction{}, err
+	}
+
+	return txn, nil
 }
 
 // FareSplit is the resolved cent breakdown of a single fare charge.

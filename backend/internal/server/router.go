@@ -5,6 +5,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"sesfikile/backend/internal/boarding"
+	"sesfikile/backend/internal/fuel"
 	"sesfikile/backend/internal/identity"
 	"sesfikile/backend/internal/routing"
 	"sesfikile/backend/internal/stops"
@@ -12,7 +13,7 @@ import (
 	"sesfikile/backend/internal/wallet"
 )
 
-func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identity.TokenIssuer, walletHandlers *wallet.Handlers, routingHandlers *routing.Handlers, telemetryHandlers *telemetry.Handlers, boardingHandlers *boarding.Handlers, stopsHandlers *stops.Handlers) chi.Router {
+func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identity.TokenIssuer, walletHandlers *wallet.Handlers, routingHandlers *routing.Handlers, telemetryHandlers *telemetry.Handlers, boardingHandlers *boarding.Handlers, stopsHandlers *stops.Handlers, fuelHandlers *fuel.Handlers) chi.Router {
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
@@ -35,6 +36,13 @@ func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identi
 	r.Get("/ws/commuter", telemetryHandlers.CommuterWS)
 	r.Get("/telemetry/vehicles", telemetryHandlers.VehiclesSnapshot)
 
+	// /fuel/viu/* are the MOCK VIU/pump endpoints (see internal/fuel/viu_mock.go)
+	// — deliberately public, since a real device sits behind hardware-level
+	// authentication, not a user JWT, and modeling that is out of scope for
+	// this MVP simulation.
+	r.Post("/fuel/viu/authorize", fuelHandlers.AuthorizePump)
+	r.Post("/fuel/viu/confirm", fuelHandlers.ConfirmPump)
+
 	r.Group(func(r chi.Router) {
 		r.Use(identity.RequireAuth(tokens))
 		r.Get("/me", identityHandlers.Me)
@@ -53,6 +61,14 @@ func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identi
 			r.Post("/telemetry/seats", telemetryHandlers.UpdateSeats)
 			r.Post("/boarding/scan", boardingHandlers.ScanPass)
 			r.Post("/stops/request/{id}/ack", stopsHandlers.AckRequest)
+		})
+
+		r.Group(func(r chi.Router) {
+			r.Use(identity.RequireRole(identity.RoleOwner))
+			r.Post("/fuel/allocate", fuelHandlers.Allocate)
+			r.Get("/fuel/balance", fuelHandlers.Balance)
+			r.Post("/fuel/vehicle/quota", fuelHandlers.FundVehicleQuota)
+			r.Get("/fuel/vehicle/quota", fuelHandlers.VehicleQuota)
 		})
 	})
 
