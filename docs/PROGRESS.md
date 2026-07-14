@@ -1851,3 +1851,185 @@ confirming the real `driver_available:true` result rendered in the UI after
 the fix above.
 
 Next: Stage 9c — owner dashboard
+
+---
+
+## Stage 9c — owner dashboard — DONE (2026-07-14)
+
+Frontend only, no backend changes — a new self-contained workspace,
+`apps/owner`, built entirely on Stage 8's read-only `/owner/*` analytics
+endpoints (`/owner/summary`, `/owner/vehicles`, `/owner/drivers`,
+`/owner/revenue-vs-fuel`, `/owner/ledger`), reusing Stage 9a/9b's
+`AuthContext`/typed-`fetch`-client pattern and the existing dev CORS
+unchanged (it reflects any `Origin`, so a fourth dev-server port needed no
+backend change).
+
+**Stack**: Vite + React 18 + TypeScript (strict), Tailwind CSS, **Recharts**
+(new dependency — the one chart-capable library needed, not present in the
+driver/commuter apps). No state library. Dev server on port **5176**
+(backend 8080, driver 5174, commuter 5175).
+
+**The one deliberate difference from the other two frontends**: this app is
+**desktop-first and data-dense**, not phone/one-handed-first — an owner
+reviews their business on a laptop, not at a rank. A persistent left
+`Sidebar` (Overview / Revenue vs Fuel / Fleet / Drivers / Ledger) replaces
+the other apps' bottom-tab bar; content is a wide grid of stat cards, a
+chart, and ruled tables with tabular-numeral money columns, not a single
+scrollable phone-width card stack. No camera, GPS, WebSocket, or QR — this
+app only ever reads `GET /owner/*`.
+
+Built:
+- `apps/owner/` scaffold: own `package.json`, `vite.config.ts` (port 5176),
+  `tsconfig.json`/`tsconfig.node.json`, Tailwind/PostCSS config,
+  `.env`/`.env.example` (`VITE_API_BASE_URL`), matching the driver/commuter
+  apps' file shapes exactly.
+- `src/types.ts` — wire types hand-mirrored from
+  `internal/analytics/{models,handlers}.go`'s actual JSON: `Summary`,
+  `VehiclesResponse`/`VehicleStat`, `DriversResponse`/`DriverStat`,
+  `RevenueVsFuel`/`RevenueVsFuelDay`, `LedgerPage`/`LedgerEntry`.
+- `src/api/client.ts` — the same typed-`fetch`-wrapper/`ApiError` pattern as
+  the other two apps, plus `getSummary`/`getVehicles`/`getDrivers`/
+  `getRevenueVsFuel`/`getLedger`, all taking an optional `{from, to}` (and
+  `getLedger` additionally `{limit, offset}`) and building the query string.
+  **Never sends an owner id as a parameter** — every `/owner/*` call is
+  scoped server-side by the caller's own JWT (`ownerFromContext` in
+  `internal/analytics/handlers.go`), exactly as the brief requires.
+- `src/context/AuthContext.tsx` — identical shape to the driver/commuter
+  apps', checking `role === "owner"` instead; same
+  `sessionStorage`-not-`localStorage` trade-off, documented the same way.
+- `src/components/`:
+  - `Sidebar.tsx` — the desktop-first vertical nav rail (five tabs, a
+    logout link, and a `.stamp-reconciled` "✓ Ledger-reconciled" badge —
+    this app's one design callout of the integrity note below).
+  - `DateRangePicker.tsx` — Today / Last 7 days / Last 30 days / Custom
+    (two date inputs). Preset math is done client-side in the browser's
+    local calendar and is **only ever used to choose a `from=` value to
+    send** — every screen displays the range the API response itself
+    echoes back (`ActiveRangeNote.tsx`), never the picker's own guess, so a
+    client/server timezone mismatch can never show as a false figure.
+  - `StatCard.tsx` — one headline figure per card; documented in its own
+    comment as rendering the API value verbatim.
+  - `ActiveRangeNote.tsx` — echoes the response's own `from`/`to`, captioned
+    "(Africa/Johannesburg time, per the backend's date-range boundary)" —
+    the one documented timezone fact from Stage 8's
+    `internal/analytics/daterange.go`, restated here rather than
+    re-derived.
+- `src/hooks/useRangeData.ts` — one generic `{data, loading, error}` hook
+  shared by four of the five screens (re-fetches on `range.from`/`range.to`
+  change); the Ledger screen manages its own fetch loop since it also needs
+  `offset` pagination state.
+- `src/format.ts` — `formatRand` (cents → `"R1,234.56"`), `formatDate(Time)`
+  — the **only** transform ever applied to a monetary figure in this app:
+  unit conversion + display formatting, never recomputation (see the
+  integrity note below).
+- Screens (`src/screens/`), wired by `src/OwnerApp.tsx` (the date range is
+  lifted once here, not duplicated per screen, so every screen genuinely
+  shares one control):
+  1. **Login** — phone + password; rejects a non-owner role client-side.
+     Seeded owner: `+27820000001` / `Owner123!`.
+  2. **Overview** (`GET /owner/summary`) — stat cards: revenue, trips,
+     passenger volume, platform fees, driver earnings paid, fuel account
+     balance, fuel allocated for the range.
+  3. **Revenue vs Fuel** (`GET /owner/revenue-vs-fuel`) — the dashboard's
+     signature view: headline totals plus a **Recharts `ComposedChart`**
+     (grouped bars for revenue vs fuel allocated per day, a dashed line for
+     fuel consumed). Y axis always starts at zero (`domain={[0, "auto"]}`)
+     and is tick-labelled in Rands via `formatRand`, not raw cents or an
+     abbreviated/truncated scale — the brief's "honestly scaled" requirement
+     taken literally. A "fuel share of revenue" percentage is computed
+     client-side for display, captioned as such, sitting right next to the
+     two unmodified source figures it divides.
+  4. **Fleet** (`GET /owner/vehicles`) — one row per vehicle: assigned
+     driver, live online/offline + current route (Stage 4 telemetry, right
+     now — not a historical log), seats, trips/revenue for the range, fuel
+     quota (available/total).
+  5. **Drivers** (`GET /owner/drivers`) — one row per driver: assigned
+     vehicle, live online status, trips/earnings for the range.
+  6. **Ledger** (`GET /owner/ledger`) — the transparency/anti-skimming view
+     made visible: a paginated (`limit`/`offset`, Previous/Next, "Showing
+     X–Y of Total"), chronological table unioning fare transactions (with
+     the owner/driver/platform split spelled out per row), fuel
+     allocations, and fuel-pump authorizations — the exact three sources
+     `internal/analytics/repo.go`'s `Ledger` CTE unions, tagged by
+     `entry_type` so the split stays visible.
+- `src/index.css`, `tailwind.config.js` — the design system (see "Design
+  direction" below): `paper`/`card`/`ink` (a cooler, calmer backdrop than
+  the commuter app's warm `dawn`), `brass` (a desaturated accent relative
+  of `rank`/`marigold`), `signal`/`alert` (online/offline,
+  positive/negative), `.ledger-card` (flat ruled-cardstock, the same
+  lineage as the other apps' `.board` but dense rather than
+  taped-and-tilted), `.stamp-reconciled`, `table.ledger-table` (ruled rows,
+  `.num` tabular-numeral cells).
+
+**INTEGRITY NOTE (per the stage brief, stated in README.md and inline
+comments)**: every monetary figure this dashboard shows is rendered
+directly from a Stage 8 `/owner/*` response field — the app displays them,
+it never recomputes or "adjusts" them. `formatRand()` only converts cents
+to a display string. The one computed-for-display value anywhere in the
+app (Revenue vs Fuel's "fuel share of revenue" ratio) is explicitly
+captioned as derived-for-display-only, sitting beside its two unmodified
+source figures so it can never be mistaken for a third ledger figure.
+
+Decisions / deviations from the original plan:
+- **Bug found and fixed during Playwright verification**:
+  `internal/analytics/repo.go`'s `Ledger` declares `var entries
+  []LedgerEntry` (a nil slice) rather than `make([]LedgerEntry, 0, ...)`
+  the way `Vehicles`/`Drivers` do — so a date range with zero ledger
+  activity serializes as JSON `entries: null`, not `entries: []` (this
+  exact shape is even called out as correct in Stage 8's own
+  `docs/PROGRESS.md` scoping-test walkthrough). `LedgerScreen.tsx` was
+  reading `.length` off that `null` and crashing. Fixed on the frontend
+  (`entries: res.entries ?? []` right after the fetch) rather than
+  touching the backend, since Stage 9c is scoped frontend-only and the
+  response shape itself is Stage 8's documented, intentional behavior —
+  the frontend just needed to handle it. Caught by logging into the
+  dashboard as a second, activity-free owner and finding a blank page
+  where a clean empty state should have rendered.
+- **`GET /owner/ledger`'s response has no `from`/`to` fields** (unlike the
+  other four endpoints), so the Ledger screen is the one screen that can't
+  render an `ActiveRangeNote` — it still sends the same range as every
+  other screen, it just can't display the server's own echo of it. Noted
+  in README.md rather than worked around by re-deriving a range client-side
+  (which would violate the "never disagree with the ledger" spirit applied
+  to dates too).
+- **Recharts pinned at the 2.x line** (`^2.13.3`, resolved to `2.15.4`)
+  rather than the newer 3.x — 2.x is stable, well-documented, and matches
+  this repo's general preference (seen in Stage 9a/9b) for conservative,
+  proven dependency versions over chasing the newest major; npm did flag
+  2.x as no-longer-actively-developed, noted here rather than silently
+  picked.
+- **Fleet/Drivers render as dense HTML tables, not cards** — a deliberate
+  desktop-first choice per the stage brief; a card-per-vehicle layout is
+  the commuter/driver apps' idiom, not this one's.
+
+Verified: `npm install`, `npx tsc --noEmit`, and `npm run build` both clean
+(the only build warning is Vite's generic "chunk larger than 500kB" advisory
+from bundling Recharts, not an error — not worth code-splitting for an MVP
+demo bundle). End-to-end verified against the live backend with Playwright
+(`playwright-core` pointed at the machine's cached Chromium, same approach
+as Stage 9b-ii, since a fresh `npx playwright install` wasn't available in
+this environment): seeded, charged five fares across both seeded vehicles,
+ran `/fuel/allocate`, funded a vehicle's fuel quota, and authorized +
+confirmed a mock VIU pump session so every figure had something non-zero to
+show; then, as the seeded owner, screenshotted the Overview stat cards, the
+Revenue vs Fuel chart (zero-based Y axis, Rand tick labels, grouped
+bars + dashed consumption line), the Fleet table, the Drivers table, and the
+Ledger table (fare/fuel_allocation/fuel_authorization rows with the
+owner/driver/platform split spelled out, oldest-first pagination); switched
+the date-range preset (Today → Last 7 days) and confirmed every screen's
+figures and echoed range updated together. **Verified owner-scoping
+visually**: logged in as a second, wholly unrelated seeded owner
+(`+27820099999` / `Owner2Pass!`) and confirmed Overview/Fleet/Ledger all show
+clean zeros/empty states, never owner 1's revenue, vehicles, or ledger rows
+— this is where the nil-slice bug above was actually caught and fixed.
+
+SCOPE HONESTY (per CLAUDE.md and the stage brief, stated in
+`apps/owner/README.md`): no cross-cutting backend changes were made or
+needed. Live fleet/driver online status still reflects Stage 4's current
+in-memory telemetry (right now, not a historical timeline) exactly as Stage
+8 already documented; this dashboard adds no new backend capability, only a
+new way to read the existing one.
+
+Next: Stage 9d — cross-cutting polish / demo prep, or the MVP feature set
+(stages 0–9c) may be considered functionally complete for a demo, at the
+team's discretion.

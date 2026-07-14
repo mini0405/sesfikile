@@ -1,0 +1,111 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background-color: theme("colors.paper.DEFAULT");
+  color: theme("colors.ink");
+}
+
+@layer components {
+  /* The back-office ledger card — ruled cream cardstock and a thin ink rule,
+     the same construction family as the driver/commuter apps' `.board`, but
+     flat and dense rather than taped-and-tilted: this is read at a desk, not
+     tapped to a windscreen or held up to a rank. */
+  .ledger-card {
+    @apply rounded-sm border border-ink/15 bg-card shadow-ledger;
+  }
+
+  .ledger-card-ruled {
+    @apply bg-ruled;
+  }
+
+  .card-heading {
+    @apply font-display text-[11px] font-black uppercase tracking-[0.18em] text-ink/50;
+  }
+
+  .stat-value {
+    @apply font-mono text-3xl font-bold tabular-nums text-ink;
+  }
+
+  /* Sidebar nav — desktop-first vertical rail rather than a phone bottom-tab
+     bar; this app is read at a desk, so navigation lives at the reading
+     margin instead of the thumb-reach zone. */
+  .nav-link {
+    @apply flex items-center gap-3 rounded-sm px-3 py-2.5 text-sm font-bold text-ink/60 transition hover:bg-paper-700/50 hover:text-ink;
+  }
+
+  .nav-link-active {
+    @apply bg-ink text-paper hover:bg-ink hover:text-paper;
+  }
+
+  /* A rubber-stamp integrity mark — same lineage as the driver app's
+     Paid/Already-Paid stamp and the commuter app's Valid/Expired stamp, here
+     repurposed for the back office's own signature claim: every figure on
+     this screen is read straight off the ledger, never adjusted. */
+  .stamp-reconciled {
+    @apply inline-flex -rotate-3 items-center gap-1.5 rounded-sm border-2 border-signal px-2.5 py-1 font-display text-[10px] font-black uppercase tracking-[0.15em] text-signal;
+  }
+
+  .status-dot {
+    @apply inline-block h-2 w-2 shrink-0 rounded-full;
+  }
+
+  .status-dot-on {
+    @apply bg-signal;
+  }
+
+  .status-dot-off {
+    @apply bg-ink/25;
+  }
+
+  /* Date-range preset pills. */
+  .range-btn {
+    @apply rounded-sm border border-ink/20 px-3 py-1.5 text-xs font-bold uppercase tracking-wide text-ink/60 transition hover:border-ink/40 hover:text-ink;
+  }
+
+  .range-btn-active {
+    @apply border-brass bg-brass text-paper hover:border-brass hover:text-paper;
+  }
+
+  .btn-brass {
+    @apply rounded-sm border-2 border-ink bg-brass px-4 py-2.5 text-center font-display text-sm font-black uppercase tracking-wide text-paper shadow-ledger transition active:translate-y-px disabled:opacity-50;
+  }
+
+  .btn-ghost {
+    @apply rounded-sm border-2 border-ink/20 bg-transparent px-4 py-2.5 text-center text-sm font-bold uppercase tracking-wide text-ink/60 transition active:translate-y-px disabled:opacity-50;
+  }
+
+  .input-field {
+    @apply rounded-sm border-2 border-ink/70 bg-paper px-3 py-2.5 text-sm font-medium text-ink outline-none focus:border-brass;
+  }
+
+  /* Ledger table: thin ruled rows, tabular numerals for every money/count
+     column — never proportional digits for figures the owner is meant to
+     compare down a column. */
+  table.ledger-table {
+    @apply w-full border-collapse text-sm;
+  }
+
+  table.ledger-table thead th {
+    @apply border-b-2 border-ink/70 px-3 py-2 text-left text-[11px] font-black uppercase tracking-wide text-ink/50;
+  }
+
+  table.ledger-table tbody td {
+    @apply border-b border-ink/10 px-3 py-2.5 align-top;
+  }
+
+  table.ledger-table tbody tr:hover td {
+    @apply bg-paper-800/40;
+  }
+
+  .num {
+    @apply font-mono tabular-nums;
+  }
+}
