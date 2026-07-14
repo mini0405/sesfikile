@@ -1609,3 +1609,119 @@ the destination-board motif holds up across the online/offline states.
 `npx tsc --noEmit` and `npm run build` re-verified clean after the restyle.
 
 Next: Stage 9b — commuter app
+
+---
+
+## Stage 9b-i — commuter app: map, route search, live vehicles — DONE (2026-07-14)
+
+Frontend only, no backend logic changes at all — reused the dev CORS added in
+Stage 9a as-is (it reflects any `Origin`, so a third dev-server port needed no
+backend change). First half of the commuter app: sign-in, the live map, route
+search, and route detail. Wallet, boarding-pass generation, and the
+active-trip screen are Stage 9b-ii, not built here.
+
+**Stack**: Vite + React 18 + TypeScript (strict), Tailwind CSS,
+`react-leaflet` + `leaflet` (OpenStreetMap tiles) for the live map. Same
+`AuthContext` (JWT in memory + `sessionStorage`) and typed-`fetch`-wrapper
+API-client pattern as the driver app (Stage 9a) — no state library, the app
+is small enough that one wouldn't earn its keep.
+
+Built:
+- `apps/commuter/` — a self-contained workspace (own `package.json`,
+  `vite.config.ts`, Tailwind/PostCSS config). Dev server on port **5175**
+  (backend 8080, driver app 5174). `VITE_API_BASE_URL` in `.env`/`.env.example`.
+- `src/api/client.ts`, `src/types.ts` — same typed-`fetch` pattern and
+  hand-mirrored wire types as the driver app; added `searchRoutes`,
+  `getRoute` and the `GET /ws/commuter` message union
+  (`CommuterSnapshotMessage`/`CommuterUpdateMessage`/`CommuterOfflineMessage`).
+- `src/context/AuthContext.tsx` — identical login/logout/token-persistence
+  shape to the driver app's, checking for `role === "commuter"` instead of
+  `"driver"`; same `sessionStorage`-not-`localStorage` trade-off, documented
+  the same way.
+- `src/hooks/useRoutesData.ts` — **there is no `GET /stops` endpoint**
+  (Stage 3 only ever needed a stop by id or exact name for `/routes/search`).
+  Rather than add a backend endpoint for a frontend-only stage, this hook
+  fetches every route (`GET /routes`) and then every route's detail
+  (`GET /routes/{id}`) once on load and de-duplicates the stops named in each
+  route's legs into a single sorted stop list — good enough at this route
+  count; would need a real endpoint if the route graph grew large. The same
+  fetched `RouteDetail` map is reused directly by the Routes screen (no
+  second fetch needed to view a route's stops).
+- `src/hooks/useRouteVehicles.ts` — the receive-only counterpart to the
+  driver app's `useDriverSocket`: owns `GET /ws/commuter?route_id=<id>`,
+  applies `snapshot`/`update`/`offline` events into a `Map<vehicleId,
+  VehicleView>`, and reconnects with the same 1s/2s/5s/8s backoff while a
+  route stays selected. No `enabled` gate (unlike the driver socket) — the
+  commuter endpoint is intentionally public (Stage 4), so watching starts the
+  instant a route is picked, logged in or not.
+- Screens (`src/screens/`), wired by `src/CommuterApp.tsx`:
+  1. **Login** — phone + password, clean error on bad credentials.
+  2. **Map (`Live` tab, the hero screen)** — a route selector (`GET /routes`)
+     plus a Leaflet map centered on Cape Town. Selected route opens
+     `useRouteVehicles`; markers are custom `.vehicle-marker` chips (not
+     Leaflet's default pin) labelled with `seats_available`. Three honest
+     states, no broken/blank map for any of them: **no route picked** yet
+     (prompt to pick one), **no vehicles online** on the picked route (empty
+     state, not a blank map), and **live** (real markers, moving as `update`
+     events arrive). A dropped socket shows a "Reconnecting" flap and
+     re-subscribes automatically.
+  3. **Search** — origin/destination pickers built from `useRoutesData`'s
+     stop list (mutually exclusive — can't pick the same stop for both),
+     `GET /routes/search?from=&to=`. Renders the ordered stop sequence across
+     all segments with a "⟳ Transfer at `<stop>`" marker between segments for
+     multi-hop results, each segment's own route name + fare, and the total
+     fixed fare in Rands. A 404 (no path) is caught by status code and shown
+     as a clean "No route found" message — not treated as a generic error.
+  4. **Routes** — a tappable list of every route; tapping shows its ordered
+     stops with each leg's fare and the full-route fare total (from the
+     already-fetched `RouteDetail` cache, no extra request). Reachable
+     directly from its own tab, or by tapping a segment in a Search result
+     (`onViewRoute` switches to this tab with that route pre-selected).
+- `src/components/BottomNav.tsx` — three tabs (`Live`/`Search`/`Routes`),
+  same mobile-first bottom-tab-bar shape as the driver app's.
+
+SCOPE HONESTY (per CLAUDE.md and the stage brief):
+- **Leaflet's tiles are fetched from OpenStreetMap over the internet** — the
+  one online dependency in an otherwise fully-local app, called out both in
+  the map screen's own footer text and in the README. No connection means a
+  blank map (the rest of the UI still renders).
+- **The stop list is derived client-side, not served by a dedicated
+  endpoint** (see `useRoutesData.ts` above) — an explicit, documented
+  workaround for a gap in Stage 3's API surface, not a new backend
+  capability.
+- No wallet balance, no boarding-pass QR generation/display, no active-trip
+  screen — all explicitly Stage 9b-ii per the brief.
+
+Decisions / deviations from the original plan:
+- **Search's origin/destination selects disable whichever stop is currently
+  chosen in the other field**, rather than allowing (then rejecting) a
+  same-stop search — a small UX guard the brief didn't ask for explicitly
+  but that avoids a pointless round-trip to the 400 the backend would
+  otherwise return for identical origin/destination.
+- **Vehicle markers use a custom `L.divIcon`, not Leaflet's default marker
+  image.** `react-leaflet`'s default marker asset path famously breaks under
+  Vite bundling; a divIcon sidesteps that entirely and lets the marker share
+  the app's own visual language (a taxi-board chip with a seat count) instead
+  of a generic map pin.
+- **The Routes tab's detail view reuses the `RouteDetail` map `useRoutesData`
+  already fetched for stop aggregation**, rather than re-fetching
+  `GET /routes/{id}` on tap — that data was already pulled down whole for the
+  stop list, so re-fetching it would be pure waste.
+
+Verified: `npm install`, `npx tsc --noEmit`, and `npm run build` all pass
+cleanly (no `go build`/backend changes to verify — this stage touched no Go
+code). Ran Postgres + `cmd/server` + `npm run dev` together and drove the
+real app end-to-end with Playwright (Chromium, same cached-browser approach
+as Stage 9a): logged in as the seeded commuter (`+27820000004` /
+`Commuter123!`); confirmed the live map's clean "no vehicles" empty state on
+a route with no driver online; brought a seeded driver online on a route via
+`cmd/wsdriver` and confirmed a real marker with a live seat count appeared on
+the map through the actual snapshot/update WebSocket flow (not mocked); ran a
+direct search (Cape Town Station → Khayelitsha Town Centre, R35.00), a
+one-transfer search (Khayelitsha Town Centre → Wynberg, transfer at Athlone,
+R31.00 total), and a genuine no-path search (Khayelitsha Town Centre →
+Muizenberg) that rendered the clean "No route found" state rather than an
+error screen; and opened a route's detail view (ordered stops + per-leg
+fares) both from a search result segment and from the Routes tab directly.
+
+Next: Stage 9b-ii — commuter app: wallet, boarding-pass generation, active trip

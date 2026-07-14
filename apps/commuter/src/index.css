@@ -1,0 +1,113 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior-y: none;
+  background-color: theme("colors.dawn.DEFAULT");
+}
+
+@layer components {
+  /* The windscreen destination board — shared identity with the driver app.
+     Same cream cardstock + hard corners + taped edge, because it's literally
+     the same board, just read from the rank instead of the cab. */
+  .board {
+    @apply relative rounded-sm border-2 border-ink bg-board text-ink shadow-board;
+  }
+
+  .tape {
+    @apply pointer-events-none absolute -top-2 h-4 w-10 rotate-[-3deg] bg-marigold/80 shadow-tape;
+  }
+
+  .board-heading {
+    @apply font-display text-[11px] font-black uppercase tracking-[0.2em] text-ink/60;
+  }
+
+  .board-value {
+    @apply font-display text-3xl font-black uppercase leading-none tracking-tight text-ink;
+  }
+
+  /* The commuter app's signature surface: a split-flap departures tile, the
+     kind bolted above a real taxi rank. Used for anything the driver app
+     would show as an instrument-cluster "led" — here it reads like waiting
+     for a board to flip over, not checking a dashboard. */
+  .flap {
+    @apply inline-flex items-center gap-2 rounded-sm border-2 border-ink/80 bg-ink px-2.5 py-1.5 font-display text-xs font-black uppercase tracking-wide text-dawn shadow-tape;
+  }
+
+  .flap-dot {
+    @apply h-2 w-2 shrink-0 rounded-full bg-current;
+  }
+
+  .flap-live {
+    @apply border-transit bg-transit/95 text-dawn;
+  }
+
+  .flap-warn {
+    @apply border-marigold-700 bg-marigold-600 text-ink;
+  }
+
+  .flap-off {
+    @apply border-ink/40 bg-ink/70 text-dawn/70;
+  }
+
+  .flap-alert {
+    @apply border-flag-600 bg-flag text-dawn;
+  }
+
+  /* Primary action: rank-wall marigold. */
+  .btn-marigold {
+    @apply w-full rounded-sm border-2 border-ink bg-marigold px-4 py-3.5 text-center font-display text-base font-black uppercase tracking-wide text-ink shadow-tape transition active:translate-y-px active:shadow-none disabled:opacity-50;
+  }
+
+  .btn-ghost {
+    @apply w-full rounded-sm border-2 border-dawn-600 bg-transparent px-4 py-3 text-center text-sm font-bold uppercase tracking-wide text-dawn-400 transition active:translate-y-px disabled:opacity-50;
+  }
+
+  /* A fare-slip ticket for search results — same family as the driver app's
+     boarding receipt, since it's the same underlying object: a printed
+     journey summary. */
+  .ticket {
+    @apply relative rounded-sm border-2 border-dashed border-dawn-600 bg-board p-5 text-ink;
+  }
+
+  .ticket::before,
+  .ticket::after {
+    content: "";
+    @apply absolute h-4 w-4 rounded-full bg-dawn;
+    top: -9px;
+  }
+  .ticket::before {
+    left: -9px;
+  }
+  .ticket::after {
+    right: -9px;
+  }
+
+  /* Vehicle marker on the live map — a rounded taxi-board chip with its seat
+     count, not a generic map pin. */
+  .vehicle-marker {
+    @apply flex items-center gap-1 rounded-full border-2 border-ink bg-transit px-2 py-1 font-display text-[11px] font-black uppercase leading-none text-dawn shadow-tape;
+  }
+}
+
+/* Leaflet ships its own base styles via leaflet.css (imported in main.tsx);
+   these overrides just keep the popup/attribution chrome in the app's
+   palette instead of Leaflet's default blue-and-white. */
+.leaflet-container {
+  font-family: inherit;
+  background: #dfe7e6;
+}
+
+.leaflet-popup-content-wrapper,
+.leaflet-popup-tip {
+  background: theme("colors.board.DEFAULT");
+  color: theme("colors.ink");
+}
