@@ -2,6 +2,7 @@ package catalogue_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -46,30 +47,97 @@ func testFareModel() config.CatalogueFareModel {
 	return config.CatalogueFareModel{BaseCents: 500, PerKmCents: 150, MinFareCents: 600, MaxFareCents: 6000}
 }
 
-// syntheticCSV builds a small CSV fixture whose every rank name embeds a
-// fresh per-run suffix, so this suite never collides with (or needs to
-// touch) real backend/data/taxi_routes.csv data, cmd/seed's baseline, or a
-// prior test run's own rows. Cleaned up precisely via cleanupSuffix, never
-// via a blanket "delete all catalogue data" — this runs against the shared
-// dev Postgres, and a developer may have a real catalogue import loaded
-// that this suite must not touch.
-func syntheticCSV(suffix string) string {
-	rows := []string{
-		fmt.Sprintf("1,ORIGIN A %s,DEST B %s,5000.0", suffix, suffix), // directional pair, forward
-		fmt.Sprintf("2,DEST B %s,ORIGIN A %s,5000.0", suffix, suffix), // directional pair, reverse — distinct
-		fmt.Sprintf("3,ORIGIN A %s,DEST B %s,7000.0", suffix, suffix), // same pair, different distance — distinct
-		fmt.Sprintf("4,,BLANK DEST %s,1000.0", suffix),                // blank origin — dropped
-	}
-	return "OBJECTID,ORGN,DSTN,SHAPE_Length\n" + strings.Join(rows, "\n") + "\n"
+// Minimal GeoJSON structs mirroring the real source shape (see
+// internal/catalogue/geojson.go's unexported equivalents) — kept separate
+// and test-local since this is an external test package; the JSON wire
+// shape is the stable contract being tested, not the internal Go types.
+type testFeatureCollection struct {
+	Type     string        `json:"type"`
+	Features []testFeature `json:"features"`
 }
 
-// cleanupSuffix deletes exactly the rows a syntheticCSV(suffix) import could
-// have created: route_legs for routes whose from/to stop names contain the
-// suffix, those routes, and those stops — precise, not a blanket sweep.
+type testFeature struct {
+	Type       string         `json:"type"`
+	Properties testProperties `json:"properties"`
+	Geometry   testGeometry   `json:"geometry"`
+}
+
+type testProperties struct {
+	ObjectID    int     `json:"OBJECTID"`
+	Origin      string  `json:"ORGN"`
+	Destination string  `json:"DSTN"`
+	ShapeLength float64 `json:"SHAPE_Length"`
+}
+
+type testGeometry struct {
+	Type        string         `json:"type"`
+	Coordinates [][][2]float64 `json:"coordinates"`
+}
+
+func syntheticGeoJSON(features []testFeature) string {
+	fc := testFeatureCollection{Type: "FeatureCollection", Features: features}
+	data, err := json.Marshal(fc)
+	if err != nil {
+		panic(err) // test fixture construction — a marshal failure here is a test bug
+	}
+	return string(data)
+}
+
+// simpleFeature builds a 2-point straight-line feature (origin -> dest),
+// enough geometry for ParseGeoJSON's endpoint/distance logic to exercise
+// fully without needing hundreds of realistic shape points.
+func simpleFeature(objectID int, origin, dest string, originLon, originLat, destLon, destLat float64) testFeature {
+	return testFeature{
+		Type:       "Feature",
+		Properties: testProperties{ObjectID: objectID, Origin: origin, Destination: dest, ShapeLength: 0.01},
+		Geometry: testGeometry{
+			Type:        "MultiLineString",
+			Coordinates: [][][2]float64{{{originLon, originLat}, {destLon, destLat}}},
+		},
+	}
+}
+
+// syntheticFeatures builds the same small fixture set every test below
+// shares: a directional pair, a same-pair-different-distance duplicate, and
+// a blank-origin row — every rank name embeds a fresh per-run suffix so
+// this suite never collides with (or needs to touch) real
+// backend/data/taxi_routes.json data, cmd/seed's baseline, or a prior test
+// run's own rows. Cleaned up precisely via cleanupSuffix, never via a
+// blanket "delete all catalogue data" — this runs against the shared dev
+// Postgres, and a developer may have a real import loaded that this suite
+// must not touch.
+func syntheticFeatures(suffix string) []testFeature {
+	originA := "ORIGIN A " + suffix
+	destB := "DEST B " + suffix
+	blankDest := "BLANK DEST " + suffix
+
+	return []testFeature{
+		simpleFeature(1, originA, destB, 18.40, -33.90, 18.45, -33.95), // directional pair, forward
+		simpleFeature(2, destB, originA, 18.45, -33.95, 18.40, -33.90), // directional pair, reverse — distinct
+		simpleFeature(3, originA, destB, 18.40, -33.90, 18.50, -34.00), // same pair, different distance — distinct
+		simpleFeature(4, "", blankDest, 0, 0, 18.4, -33.9),             // blank origin — dropped
+	}
+}
+
+func syntheticCSV(suffix string) string {
+	return syntheticGeoJSON(syntheticFeatures(suffix))
+}
+
+// cleanupSuffix deletes exactly the rows a syntheticFeatures(suffix) import
+// could have created: geometry + legs for routes whose from/to stop names
+// contain the suffix, those routes, and those stops — precise, not a
+// blanket sweep.
 func cleanupSuffix(t *testing.T, pool *pgxpool.Pool, suffix string) {
 	t.Helper()
 	ctx := context.Background()
 	pattern := "%" + suffix + "%"
+	_, _ = pool.Exec(ctx, `
+		DELETE FROM route_geometries
+		WHERE route_id IN (
+			SELECT rl.route_id FROM route_legs rl
+			JOIN stops s ON s.id = rl.from_stop_id OR s.id = rl.to_stop_id
+			WHERE s.name LIKE $1
+		)`, pattern)
 	_, _ = pool.Exec(ctx, `
 		DELETE FROM route_legs
 		WHERE from_stop_id IN (SELECT id FROM stops WHERE name LIKE $1)
@@ -115,20 +183,34 @@ func TestImport_ParsesAndTagsCatalogueSource(t *testing.T) {
 	if !leg.FareEstimated {
 		t.Error("expected the imported leg's fare to be flagged fare_estimated=true")
 	}
-	if leg.DistanceMeters == nil || *leg.DistanceMeters != 5000.0 {
-		t.Errorf("expected distance_meters=5000.0, got %v", leg.DistanceMeters)
+	if leg.DistanceMeters == nil || *leg.DistanceMeters <= 0 {
+		t.Errorf("expected a positive computed distance_meters, got %v", leg.DistanceMeters)
 	}
-	wantFare := catalogue.EstimateFareCents(5000.0, testFareModel())
+	wantFare := catalogue.EstimateFareCents(*leg.DistanceMeters, testFareModel())
 	if leg.FareCents != wantFare {
 		t.Errorf("expected fare_cents=%d (from EstimateFareCents), got %d", wantFare, leg.FareCents)
 	}
 
+	// Post-GeoJSON-upgrade: a catalogue stop now HAS a (median-derived,
+	// approximate) coordinate, tagged source='catalogue'.
 	fromStop, err := repo.GetStopByID(ctx, leg.FromStopID)
 	if err != nil {
 		t.Fatalf("failed to load from-stop: %v", err)
 	}
-	if fromStop.CoordinatesKnown() {
-		t.Error("expected a catalogue-imported stop to have NO known coordinates")
+	if !fromStop.CoordinatesKnown() {
+		t.Error("expected a catalogue-imported stop to HAVE a known (approximate) coordinate")
+	}
+	if fromStop.Source != routing.SourceCatalogue {
+		t.Errorf("expected the stop's source=%q, got %q", routing.SourceCatalogue, fromStop.Source)
+	}
+
+	// The route's polyline must be stored and retrievable.
+	points, err := repo.GetRouteGeometry(ctx, route.ID)
+	if err != nil {
+		t.Fatalf("expected the route's geometry to be stored: %v", err)
+	}
+	if len(points) != 2 {
+		t.Errorf("expected 2 stored points (the synthetic fixture's straight line), got %d", len(points))
 	}
 }
 
@@ -167,21 +249,21 @@ func TestImport_DirectionalAndDuplicateDistanceRoutesKeptDistinct(t *testing.T) 
 }
 
 // TestImport_Idempotent confirms re-running Import against the identical
-// CSV creates nothing new — every row is recognized as already imported via
-// its OBJECTID-embedding route name.
+// data creates nothing new — every row is recognized as already imported
+// via its OBJECTID-embedding route name.
 func TestImport_Idempotent(t *testing.T) {
 	repo, pool := setup(t)
 	ctx := context.Background()
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
 	t.Cleanup(func() { cleanupSuffix(t, pool, suffix) })
-	csvText := syntheticCSV(suffix)
+	data := syntheticCSV(suffix)
 
-	first, err := catalogue.Import(ctx, repo, strings.NewReader(csvText), testFareModel())
+	first, err := catalogue.Import(ctx, repo, strings.NewReader(data), testFareModel())
 	if err != nil {
 		t.Fatalf("first Import failed: %v", err)
 	}
 
-	second, err := catalogue.Import(ctx, repo, strings.NewReader(csvText), testFareModel())
+	second, err := catalogue.Import(ctx, repo, strings.NewReader(data), testFareModel())
 	if err != nil {
 		t.Fatalf("second Import failed: %v", err)
 	}
@@ -199,7 +281,7 @@ func TestImport_Idempotent(t *testing.T) {
 
 // TestImport_DoesNotAffectSeedBaseline is this feature's core non-negotiable:
 // importing the catalogue must never change cmd/seed's own hand-seeded
-// route count.
+// route or stop count.
 func TestImport_DoesNotAffectSeedBaseline(t *testing.T) {
 	repo, pool := setup(t)
 	ctx := context.Background()
@@ -207,9 +289,13 @@ func TestImport_DoesNotAffectSeedBaseline(t *testing.T) {
 	if err := routing.SeedCorridors(ctx, repo); err != nil {
 		t.Fatalf("failed to seed baseline corridors: %v", err)
 	}
-	seedCountBefore, err := repo.CountRoutesBySource(ctx, routing.SourceSeed)
+	seedRouteCountBefore, err := repo.CountRoutesBySource(ctx, routing.SourceSeed)
 	if err != nil {
 		t.Fatalf("failed to count seed routes: %v", err)
+	}
+	seedStopCountBefore, err := repo.CountStopsBySource(ctx, routing.SourceSeed)
+	if err != nil {
+		t.Fatalf("failed to count seed stops: %v", err)
 	}
 
 	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
@@ -218,11 +304,95 @@ func TestImport_DoesNotAffectSeedBaseline(t *testing.T) {
 		t.Fatalf("Import failed: %v", err)
 	}
 
-	seedCountAfter, err := repo.CountRoutesBySource(ctx, routing.SourceSeed)
+	seedRouteCountAfter, err := repo.CountRoutesBySource(ctx, routing.SourceSeed)
 	if err != nil {
 		t.Fatalf("failed to count seed routes after import: %v", err)
 	}
-	if seedCountAfter != seedCountBefore {
-		t.Fatalf("expected the seed-tagged route count to stay exactly %d after a catalogue import, got %d", seedCountBefore, seedCountAfter)
+	if seedRouteCountAfter != seedRouteCountBefore {
+		t.Fatalf("expected the seed-tagged route count to stay exactly %d after a catalogue import, got %d", seedRouteCountBefore, seedRouteCountAfter)
+	}
+
+	seedStopCountAfter, err := repo.CountStopsBySource(ctx, routing.SourceSeed)
+	if err != nil {
+		t.Fatalf("failed to count seed stops after import: %v", err)
+	}
+	if seedStopCountAfter != seedStopCountBefore {
+		t.Fatalf("expected the seed-tagged stop count to stay exactly %d after a catalogue import, got %d", seedStopCountBefore, seedStopCountAfter)
+	}
+}
+
+// TestImport_EveryCreatedStopHasACoordinate is the "no orphans in either
+// direction" guarantee: every stop a catalogue import creates has a known
+// coordinate (median-derived), and — since every canonical rank name that
+// gets a stop came from at least one parsed row's endpoint — no rank is
+// ever left stop-less or coordinate-less by a normal import.
+func TestImport_EveryCreatedStopHasACoordinate(t *testing.T) {
+	repo, pool := setup(t)
+	ctx := context.Background()
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	t.Cleanup(func() { cleanupSuffix(t, pool, suffix) })
+
+	if _, err := catalogue.Import(ctx, repo, strings.NewReader(syntheticCSV(suffix)), testFareModel()); err != nil {
+		t.Fatalf("Import failed: %v", err)
+	}
+
+	for _, name := range []string{"ORIGIN A " + suffix, "DEST B " + suffix} {
+		stop, err := repo.GetStopByName(ctx, name)
+		if err != nil {
+			t.Fatalf("expected stop %q to exist: %v", name, err)
+		}
+		if !stop.CoordinatesKnown() {
+			t.Errorf("expected stop %q to have a known coordinate, got none", name)
+		}
+	}
+}
+
+func TestImport_MedianCoordinateResistsOutliers(t *testing.T) {
+	repo, pool := setup(t)
+	ctx := context.Background()
+	suffix := fmt.Sprintf("%d", time.Now().UnixNano())
+	t.Cleanup(func() { cleanupSuffix(t, pool, suffix) })
+
+	rank := "MEDIAN TEST RANK " + suffix
+	dest := "MEDIAN TEST DEST " + suffix
+
+	// A tight cluster of endpoint samples around (18.400, -33.900), plus one
+	// wild outlier nowhere near Cape Town — mirrors a real rank (e.g.
+	// Khayelitsha) whose routes depart from genuinely spread-out points.
+	features := []testFeature{
+		simpleFeature(1, rank, dest, 18.398, -33.898, 18.5, -34.0),
+		simpleFeature(2, rank, dest, 18.399, -33.899, 18.5, -34.0),
+		simpleFeature(3, rank, dest, 18.400, -33.900, 18.5, -34.0),
+		simpleFeature(4, rank, dest, 18.401, -33.901, 18.5, -34.0),
+		simpleFeature(5, rank, dest, 18.402, -33.902, 18.5, -34.0),
+		simpleFeature(6, rank, dest, 25.0, -29.0, 18.5, -34.0), // outlier
+	}
+
+	if _, err := catalogue.Import(ctx, repo, strings.NewReader(syntheticGeoJSON(features)), testFareModel()); err != nil {
+		t.Fatalf("Import failed: %v", err)
+	}
+
+	stop, err := repo.GetStopByName(ctx, rank)
+	if err != nil {
+		t.Fatalf("expected rank stop to exist: %v", err)
+	}
+	if !stop.CoordinatesKnown() {
+		t.Fatal("expected the rank stop to have a coordinate")
+	}
+
+	lon, lat := *stop.Longitude, *stop.Latitude
+	// Median of {18.398, 18.399, 18.400, 18.401, 18.402, 25.0} = (18.400+18.401)/2 = 18.4005
+	if diff := lon - 18.4005; diff > 0.01 || diff < -0.01 {
+		t.Errorf("expected median longitude near 18.4005 (the cluster), got %v", lon)
+	}
+	if diff := lat - (-33.9005); diff > 0.01 || diff < -0.01 {
+		t.Errorf("expected median latitude near -33.9005 (the cluster), got %v", lat)
+	}
+
+	// The MEAN would have been dragged far toward the outlier — confirm the
+	// actual (median) result is nowhere near it.
+	meanLon := (18.398 + 18.399 + 18.400 + 18.401 + 18.402 + 25.0) / 6
+	if diff := lon - meanLon; diff < 0.5 && diff > -0.5 {
+		t.Errorf("stop longitude (%v) is suspiciously close to the MEAN (%v) — expected the median to resist the outlier", lon, meanLon)
 	}
 }

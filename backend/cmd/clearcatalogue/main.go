@@ -1,10 +1,10 @@
-// Command clearcatalogue removes every source='catalogue' route/leg/stop
-// added by cmd/importcatalogue, restoring the database to the clean
-// cmd/seed 8-corridor/12-stop baseline. SAFE: it only ever touches rows
-// tagged source='catalogue' (routes) and coordinate-less orphaned stops —
-// see routing.Repo.DeleteCatalogueData for the exact scoping guarantee.
-// Mirrors cmd/cleanup's shape: defaults to a DRY RUN; pass -apply to
-// actually delete.
+// Command clearcatalogue removes every source='catalogue' route/leg/stop/
+// geometry added by cmd/importcatalogue, restoring the database to the
+// clean cmd/seed 8-corridor/12-stop baseline. SAFE: it only ever touches
+// rows tagged source='catalogue' (both routes and, since the GeoJSON
+// upgrade, stops too — see routing.Repo.DeleteCatalogueData for the exact
+// scoping guarantee). Mirrors cmd/cleanup's shape: defaults to a DRY RUN;
+// pass -apply to actually delete.
 //
 // Usage:
 //
@@ -46,13 +46,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "failed to count catalogue routes: %v\n", err)
 		os.Exit(1)
 	}
-	stopCount, err := repo.CountStopsWithoutCoordinates(ctx)
+	stopCount, err := repo.CountStopsBySource(ctx, routing.SourceCatalogue)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to count coordinate-less stops: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to count catalogue stops: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Found %d catalogue route(s) and %d coordinate-less stop(s) (candidates for removal once orphaned by the routes above).\n", routeCount, stopCount)
+	fmt.Printf("Found %d catalogue route(s) and %d catalogue stop(s) (stops removed only if orphaned once the routes above are gone).\n", routeCount, stopCount)
 
 	if !*apply {
 		fmt.Println("\nDRY RUN — no rows deleted. Re-run with -apply to delete them and restore the clean 8-corridor/12-stop seeded baseline.")
@@ -70,5 +70,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("\nDeleted %d route_leg(s), %d route(s), %d stop(s).\n", stats.LegsDeleted, stats.RoutesDeleted, stats.StopsDeleted)
+	fmt.Printf("\nDeleted %d route_geometry row(s), %d route_leg(s), %d route(s), %d stop(s).\n",
+		stats.GeometriesDeleted, stats.LegsDeleted, stats.RoutesDeleted, stats.StopsDeleted)
 }

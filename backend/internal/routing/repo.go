@@ -2,6 +2,7 @@ package routing
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 
 	"github.com/google/uuid"
@@ -19,36 +20,54 @@ func NewRepo(pool *pgxpool.Pool) *Repo {
 	return &Repo{pool: pool}
 }
 
+// CreateStop inserts a hand-seeded stop (cmd/seed) — source defaults to
+// 'seed' via the column's DB default. Use CreateCatalogueStop for a
+// catalogue-imported stop with a real (if approximate) coordinate, or
+// CreateStopNoCoordinates for one with none.
 func (r *Repo) CreateStop(ctx context.Context, name string, latitude, longitude float64) (Stop, error) {
 	var s Stop
 	err := r.pool.QueryRow(ctx,
 		`INSERT INTO stops (name, latitude, longitude) VALUES ($1, $2, $3)
-		 RETURNING id, name, latitude, longitude, created_at`,
+		 RETURNING id, name, latitude, longitude, source, created_at`,
 		name, latitude, longitude,
-	).Scan(&s.ID, &s.Name, &s.Latitude, &s.Longitude, &s.CreatedAt)
+	).Scan(&s.ID, &s.Name, &s.Latitude, &s.Longitude, &s.Source, &s.CreatedAt)
 	return s, err
 }
 
-// CreateStopNoCoordinates inserts a stop with NO known position — used only
-// by internal/catalogue's importer, since the source CSV carries no
-// coordinates at all. Stop.CoordinatesKnown() reports false for a stop
-// created this way, until/unless a real position is ever added for it.
+// CreateCatalogueStop inserts a stop tagged source='catalogue' with a real
+// (APPROXIMATE — see internal/catalogue.medianCoordinate) coordinate. Used
+// by internal/catalogue's importer for every rank it creates a stop for.
+func (r *Repo) CreateCatalogueStop(ctx context.Context, name string, latitude, longitude float64) (Stop, error) {
+	var s Stop
+	err := r.pool.QueryRow(ctx,
+		`INSERT INTO stops (name, latitude, longitude, source) VALUES ($1, $2, $3, 'catalogue')
+		 RETURNING id, name, latitude, longitude, source, created_at`,
+		name, latitude, longitude,
+	).Scan(&s.ID, &s.Name, &s.Latitude, &s.Longitude, &s.Source, &s.CreatedAt)
+	return s, err
+}
+
+// CreateStopNoCoordinates inserts a stop tagged source='catalogue' with NO
+// known position — a defensive fallback for internal/catalogue's importer
+// (every rank it processes has at least one endpoint sample in practice, so
+// this path is not expected to be hit by a real import). Stop.CoordinatesKnown()
+// reports false for a stop created this way.
 func (r *Repo) CreateStopNoCoordinates(ctx context.Context, name string) (Stop, error) {
 	var s Stop
 	err := r.pool.QueryRow(ctx,
-		`INSERT INTO stops (name, latitude, longitude) VALUES ($1, NULL, NULL)
-		 RETURNING id, name, latitude, longitude, created_at`,
+		`INSERT INTO stops (name, latitude, longitude, source) VALUES ($1, NULL, NULL, 'catalogue')
+		 RETURNING id, name, latitude, longitude, source, created_at`,
 		name,
-	).Scan(&s.ID, &s.Name, &s.Latitude, &s.Longitude, &s.CreatedAt)
+	).Scan(&s.ID, &s.Name, &s.Latitude, &s.Longitude, &s.Source, &s.CreatedAt)
 	return s, err
 }
 
 func (r *Repo) GetStopByName(ctx context.Context, name string) (Stop, error) {
 	var s Stop
 	err := r.pool.QueryRow(ctx,
-		`SELECT id, name, latitude, longitude, created_at FROM stops WHERE name = $1`,
+		`SELECT id, name, latitude, longitude, source, created_at FROM stops WHERE name = $1`,
 		name,
-	).Scan(&s.ID, &s.Name, &s.Latitude, &s.Longitude, &s.CreatedAt)
+	).Scan(&s.ID, &s.Name, &s.Latitude, &s.Longitude, &s.Source, &s.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Stop{}, ErrNotFound
@@ -61,9 +80,9 @@ func (r *Repo) GetStopByName(ctx context.Context, name string) (Stop, error) {
 func (r *Repo) GetStopByID(ctx context.Context, id uuid.UUID) (Stop, error) {
 	var s Stop
 	err := r.pool.QueryRow(ctx,
-		`SELECT id, name, latitude, longitude, created_at FROM stops WHERE id = $1`,
+		`SELECT id, name, latitude, longitude, source, created_at FROM stops WHERE id = $1`,
 		id,
-	).Scan(&s.ID, &s.Name, &s.Latitude, &s.Longitude, &s.CreatedAt)
+	).Scan(&s.ID, &s.Name, &s.Latitude, &s.Longitude, &s.Source, &s.CreatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return Stop{}, ErrNotFound
@@ -74,7 +93,7 @@ func (r *Repo) GetStopByID(ctx context.Context, id uuid.UUID) (Stop, error) {
 }
 
 func (r *Repo) ListStops(ctx context.Context) ([]Stop, error) {
-	rows, err := r.pool.Query(ctx, `SELECT id, name, latitude, longitude, created_at FROM stops ORDER BY name`)
+	rows, err := r.pool.Query(ctx, `SELECT id, name, latitude, longitude, source, created_at FROM stops ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +102,7 @@ func (r *Repo) ListStops(ctx context.Context) ([]Stop, error) {
 	stops := []Stop{}
 	for rows.Next() {
 		var s Stop
-		if err := rows.Scan(&s.ID, &s.Name, &s.Latitude, &s.Longitude, &s.CreatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.Name, &s.Latitude, &s.Longitude, &s.Source, &s.CreatedAt); err != nil {
 			return nil, err
 		}
 		stops = append(stops, s)
@@ -91,14 +110,16 @@ func (r *Repo) ListStops(ctx context.Context) ([]Stop, error) {
 	return stops, rows.Err()
 }
 
-// ListStopsWithCoordinates is the map-facing read path: every stop EXCLUDING
-// catalogue-imported ones, which have no coordinates (see
-// Stop.CoordinatesKnown). Use this wherever a caller is about to place a
-// stop on a map; use ListStops (or the route-scoped GET /stops?route_id=)
-// for browse/search uses that don't need a position.
+// ListStopsWithCoordinates is the map-facing read path: every stop with a
+// known position, regardless of source. Before the GeoJSON upgrade this
+// excluded every catalogue stop (they had none); now a catalogue stop's
+// APPROXIMATE (median-derived) coordinate makes it map-eligible too — the
+// intended upgrade. Use this wherever a caller is about to place a stop on
+// a map; use ListStops (or the route-scoped GET /stops?route_id=) for
+// browse/search uses that don't need a position.
 func (r *Repo) ListStopsWithCoordinates(ctx context.Context) ([]Stop, error) {
 	rows, err := r.pool.Query(ctx,
-		`SELECT id, name, latitude, longitude, created_at FROM stops WHERE latitude IS NOT NULL ORDER BY name`)
+		`SELECT id, name, latitude, longitude, source, created_at FROM stops WHERE latitude IS NOT NULL ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +128,7 @@ func (r *Repo) ListStopsWithCoordinates(ctx context.Context) ([]Stop, error) {
 	stops := []Stop{}
 	for rows.Next() {
 		var s Stop
-		if err := rows.Scan(&s.ID, &s.Name, &s.Latitude, &s.Longitude, &s.CreatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.Name, &s.Latitude, &s.Longitude, &s.Source, &s.CreatedAt); err != nil {
 			return nil, err
 		}
 		stops = append(stops, s)
@@ -116,11 +137,23 @@ func (r *Repo) ListStopsWithCoordinates(ctx context.Context) ([]Stop, error) {
 }
 
 // CountStopsWithoutCoordinates reports how many stops currently have no
-// known position — every one of these is catalogue-imported (see
-// Stop.CoordinatesKnown), used by cmd/clearcatalogue's dry-run report.
+// known position — after the GeoJSON upgrade this should normally be 0 even
+// with the catalogue loaded (every rank gets a median-derived coordinate);
+// non-zero would mean the defensive CreateStopNoCoordinates fallback was
+// actually hit. Used by cmd/clearcatalogue's dry-run report.
 func (r *Repo) CountStopsWithoutCoordinates(ctx context.Context) (int, error) {
 	var n int
 	err := r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM stops WHERE latitude IS NULL`).Scan(&n)
+	return n, err
+}
+
+// CountStopsBySource reports how many stops are tagged the given source
+// ("seed" or "catalogue") — used by cmd/clearcatalogue's dry-run report and
+// by tests confirming the seeded baseline's stop count is unaffected by an
+// import.
+func (r *Repo) CountStopsBySource(ctx context.Context, source string) (int, error) {
+	var n int
+	err := r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM stops WHERE source = $1`, source).Scan(&n)
 	return n, err
 }
 
@@ -210,45 +243,56 @@ func (r *Repo) CountRoutesBySource(ctx context.Context, source string) (int, err
 }
 
 // DeleteCatalogueData removes every catalogue-imported route (source =
-// 'catalogue') and its leg(s), then any stop left with zero remaining
-// route_legs references as a result. SAFE and idempotent — a hand-seeded
-// route (source = 'seed') is never matched by the first delete, and a stop
-// with known coordinates is never matched by the second (only a
-// catalogue-imported stop is ever coordinate-less), so cmd/seed's baseline
-// is structurally unreachable by this method regardless of what else exists
-// in the database.
-func (r *Repo) DeleteCatalogueData(ctx context.Context) (routesDeleted, legsDeleted, stopsDeleted int64, err error) {
+// 'catalogue'), its geometry and leg(s), then any stop tagged
+// source='catalogue' left with zero remaining route_legs references as a
+// result. SAFE and idempotent — a hand-seeded route/stop (source = 'seed')
+// is never matched by any of these deletes, so cmd/seed's baseline is
+// structurally unreachable by this method regardless of what else exists in
+// the database.
+//
+// Stops are scoped by source, not by "has no coordinates" — since the
+// GeoJSON upgrade, a catalogue stop DOES have a (median-derived,
+// approximate) coordinate, so coordinate-presence alone can no longer tell
+// a catalogue stop from a hand-seeded one; source is the only reliable
+// signal now (see stops.source's migration comment).
+func (r *Repo) DeleteCatalogueData(ctx context.Context) (routesDeleted, legsDeleted, stopsDeleted, geometriesDeleted int64, err error) {
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	defer tx.Rollback(ctx)
 
+	geometriesTag, err := tx.Exec(ctx, `
+		DELETE FROM route_geometries
+		WHERE route_id IN (SELECT id FROM routes WHERE source = 'catalogue')`)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
 	legsTag, err := tx.Exec(ctx, `
 		DELETE FROM route_legs
 		WHERE route_id IN (SELECT id FROM routes WHERE source = 'catalogue')`)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	routesTag, err := tx.Exec(ctx, `DELETE FROM routes WHERE source = 'catalogue'`)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 	stopsTag, err := tx.Exec(ctx, `
 		DELETE FROM stops
-		WHERE latitude IS NULL
+		WHERE source = 'catalogue'
 		AND NOT EXISTS (
 			SELECT 1 FROM route_legs rl
 			WHERE rl.from_stop_id = stops.id OR rl.to_stop_id = stops.id
 		)`)
 	if err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return 0, 0, 0, err
+		return 0, 0, 0, 0, err
 	}
-	return routesTag.RowsAffected(), legsTag.RowsAffected(), stopsTag.RowsAffected(), nil
+	return routesTag.RowsAffected(), legsTag.RowsAffected(), stopsTag.RowsAffected(), geometriesTag.RowsAffected(), nil
 }
 
 // CreateRouteLeg inserts a hand-seeded leg (cmd/seed) — distance_meters
@@ -322,4 +366,47 @@ func (r *Repo) AllRoutesWithLegs(ctx context.Context) ([]RouteWithLegs, error) {
 		result = append(result, RouteWithLegs{Route: rt, Legs: legs})
 	}
 	return result, nil
+}
+
+// CreateRouteGeometry stores a route's full display polyline: points is an
+// ordered slice of [lon, lat] pairs (WGS84, GeoJSON coordinate order),
+// marshaled to a flat JSONB array (see the 000006 migration's doc comment
+// for why JSONB over a native geometry column). Used only by
+// internal/catalogue's importer — a hand-seeded route never gets one.
+// ON CONFLICT DO NOTHING makes a re-import idempotent alongside
+// CreateCatalogueRoute's own name-based idempotency check.
+func (r *Repo) CreateRouteGeometry(ctx context.Context, routeID uuid.UUID, points [][2]float64) error {
+	data, err := json.Marshal(points)
+	if err != nil {
+		return err
+	}
+	_, err = r.pool.Exec(ctx,
+		`INSERT INTO route_geometries (route_id, geometry, point_count) VALUES ($1, $2, $3)
+		 ON CONFLICT (route_id) DO NOTHING`,
+		routeID, data, len(points),
+	)
+	return err
+}
+
+// GetRouteGeometry returns a route's stored display polyline ([lon, lat]
+// pairs, WGS84, in path order), or ErrNotFound if the route has none (every
+// hand-seeded route, and any catalogue route imported before geometry
+// storage existed).
+func (r *Repo) GetRouteGeometry(ctx context.Context, routeID uuid.UUID) ([][2]float64, error) {
+	var data []byte
+	err := r.pool.QueryRow(ctx,
+		`SELECT geometry FROM route_geometries WHERE route_id = $1`, routeID,
+	).Scan(&data)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+
+	var points [][2]float64
+	if err := json.Unmarshal(data, &points); err != nil {
+		return nil, err
+	}
+	return points, nil
 }

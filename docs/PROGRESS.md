@@ -2831,4 +2831,326 @@ go run ./cmd/clearcatalogue          # dry run — shows what would be removed
 go run ./cmd/clearcatalogue -apply   # actually removes it
 ```
 
-Next: Stage 9d — cross-cutting polish (or further backend/frontend work, as directed)
+**Superseded by the GeoJSON upgrade below** — the CSV importer (`ParseCSV`,
+`-csv` flag) described above no longer exists; `GET /stops` unfiltered no
+longer stays at 12 once the catalogue is loaded, since catalogue stops now
+have real (approximate) coordinates. Kept this section for historical
+context on the original opt-in design (source tagging, idempotency,
+clear/undo) since all of that carried forward unchanged.
+
+---
+
+## Real route catalogue import: GeoJSON upgrade — DONE (2026-07-15)
+
+Upgrades the opt-in importer above to read `backend/data/taxi_routes.json`
+(the GeoJSON version of the same City of Cape Town dataset) instead of the
+CSV — adding real geometry (polylines + endpoint coordinates) the CSV
+lacked. Still backend-only, still additive, still opt-in: `cmd/seed`'s
+8-route/12-stop baseline is untouched, and `go test -race ./...` is green
+with the catalogue not loaded. No frontend apps touched (a follow-up will
+render the polylines).
+
+**Reused unchanged from the original entry**: the 24-entry conservative
+name-normalization map and its live drift test, the blank-endpoint-row
+drop, the distance-based `EstimateFareCents` model
+(`config.CatalogueFareModel`) and `fare_estimated` labelling, and
+`routes.source='catalogue'` tagging/idempotency (route names still embed the
+source `OBJECTID`).
+
+**Retired**: the CSV-only importer (`internal/catalogue/csv.go`, `ParseCSV`,
+`cmd/importcatalogue -csv`). The GeoJSON is a strict superset of the CSV's
+attributes (same `OBJECTID`/`ORGN`/`DSTN`, plus geometry), so maintaining two
+parallel parsers had no upside — deleted rather than kept as a dead
+alternate path, per this repo's usual "delete unused code" convention.
+`backend/data/taxi_routes.csv` itself is left in place (tiny, harmless,
+already committed) purely as a historical reference; nothing reads it
+anymore.
+
+**Migrating from an old CSV-loaded catalogue**: route/stop names are derived
+identically from the same `ORGN`/`DSTN`/`OBJECTID` attributes in both files,
+so a database that already has the CSV-era catalogue loaded would see every
+row as "already imported" (same names) rather than getting enriched with
+geometry. This is a full replacement, not an in-place upgrade — run
+`cmd/clearcatalogue -apply` first, then re-import from the GeoJSON.
+
+### A discovery that changed the plan: SHAPE_Length is in the wrong unit
+
+Cross-checking the GeoJSON against the original CSV for the same feature
+(`OBJECTID` 1, BELLVILLE→DURBANVILLE) showed `properties.SHAPE_Length` is
+**0.1006** in the GeoJSON vs **12918.67** in the CSV — the GeoJSON's
+`SHAPE_Length` turned out to be the path length in decimal degrees
+(unprojected CRS84), not metres. Rather than depend on an attribute in the
+wrong unit (or require having the CSV around just to cross-check it),
+`internal/catalogue/geo.go`'s `polylineLengthMeters` computes each route's
+real distance directly from its geometry — summing haversine distance
+between every consecutive polyline vertex. This is arguably more correct
+than trusting either file's own attribute: it's a direct, honest
+measurement of the actual real-world path, not a value computed elsewhere
+under an unstated (and in this case wrong) projection/unit assumption.
+Sanity-checked against the CSV's own figure for `OBJECTID` 1 (10,714.8m
+computed vs 12,918.67m in the CSV — same order of magnitude, consistent with
+a great-circle sum vs a differently-projected polyline length, not a bug).
+
+### NEW: rank coordinates from endpoints (APPROXIMATE)
+
+For each feature, the polyline's **first point is the origin rank's
+location** and the **last point is the destination rank's location**. A
+rank appears as an endpoint across many routes with real spread (a large
+area like Khayelitsha has routes departing from genuinely different points
+~20km apart) — so `internal/catalogue/import.go`'s `prepareRows` does a
+**first pass over the whole file**, before creating any stop, collecting
+every endpoint sample a canonical rank name appears at (as an origin's first
+point *or* a destination's last point, from any row), then
+`geo.go`'s `medianCoordinate` computes that rank's stop coordinate as the
+**median of its samples' longitudes and the median of its samples'
+latitudes independently** — explicitly NOT the mean, which a handful of
+outlier endpoints (or a single bad geometry row) can drag toward an
+unrepresentative or even invalid location; the per-axis median snaps to
+wherever the bulk of the samples actually cluster.
+
+- This is the simpler **per-axis coordinate median**, not the true
+  geometric median (which would minimise total distance to every sample via
+  an iterative algorithm like Weiszfeld's) — sufficient for an approximate
+  rank centroid and exactly what was asked for.
+- Coordinates are keyed on the **same canonical (post-`Normalize`) rank
+  names** the 24-entry folding map produces, computed in the same first pass
+  that later creates stops — so every stop a normal import creates is
+  guaranteed to have a coordinate; there is structurally no way for a
+  rank's stop and its coordinate to key on different spellings.
+- **Explicitly labelled approximate, not surveyed**: `routing.Stop`'s doc
+  comment, `internal/catalogue/geo.go`'s `medianCoordinate` doc comment, and
+  every printed/API-facing description of a catalogue stop all say so. A
+  catalogue stop's `source` field (see below) is the one place a consumer
+  can tell "this coordinate is a derived centroid" from "this coordinate is
+  hand-placed and exact."
+
+### NEW: route_geometries — polylines stored for later display
+
+Each catalogue route's full polyline is stored via a new
+`route_geometries` table (migration `000006`): `route_id` (PK/FK),
+`geometry` (**JSONB**, a flat array of `[lon, lat]` pairs in path order),
+`point_count`. **JSONB over PostGIS/a native geometry column**: every
+feature in the source dataset is a `MultiLineString` with exactly one
+`LineString` part (verified against the real file — 0 of 1466 features have
+more than one part), so flattening to a plain point array loses nothing;
+this MVP only ever needs to read a route's polyline back **whole**, for
+display — no spatial queries (`ST_Intersects`, nearest-neighbour,
+simplification) run against it. Reusing JSONB avoids a new Postgres
+extension and a new Go dependency for a need this simple.
+`routing.Repo.CreateRouteGeometry`/`GetRouteGeometry` marshal/unmarshal via
+plain `encoding/json` — no new dependency. New public read:
+**`GET /routes/{id}/geometry`** — `{route_id, point_count, points}`, 404 for
+a route with none (every hand-seeded corridor, and correctly distinguishable
+from "route doesn't exist" only in the message, not the status — neither
+case has anything to draw).
+
+If polyline storage ever bloats the database at scale, Douglas-Peucker
+simplification is a **noted future option, not implemented here** — at
+~394 points average × 1447 routes, current storage is unremarkable for a
+JSONB column and didn't warrant the added complexity for this pass.
+
+### A necessary fix uncovered along the way: stops needed their own `source`
+
+Before this upgrade, a catalogue stop *always* had `latitude IS NULL`, so
+`cmd/clearcatalogue`'s orphan-stop cleanup could safely find "every
+catalogue stop" via that one check. Once catalogue stops get a real
+(median-derived) coordinate, that check can no longer tell a catalogue stop
+from a hand-seeded one — coordinate presence stopped being a reliable
+provenance signal. Migration `000006` adds **`stops.source`**, mirroring
+`routes.source` exactly (`DEFAULT 'seed' CHECK (source IN ('seed',
+'catalogue'))`, indexed): `routing.Repo.CreateCatalogueStop` (new — real
+coordinates, tagged catalogue) and `CreateStopNoCoordinates` (kept as a
+defensive fallback, now also tagged catalogue) both set it explicitly;
+`DeleteCatalogueData`'s stop-deletion query now scopes on `source =
+'catalogue'` instead of `latitude IS NULL`. Caught by rewriting
+`internal/routing/catalogue_repo_test.go`'s delete-scoping test to use
+coordinate-*bearing* catalogue stops (the real post-upgrade shape) rather
+than coordinate-less ones — the old version would have quietly stopped
+proving anything once stops started getting real coordinates.
+
+### Also uncovered: catalogue routes needed an explicit live-matching guard
+
+Stage 6's request-a-stop matching (`internal/stops`) previously relied on a
+coordinate check alone to keep catalogue routes out of live driver-matching
+(no coordinates → automatic rejection). Now that catalogue stops have
+coordinates, that guard would no longer by itself block one — a request
+against a catalogue route would fall through to "zero online drivers on
+this route" and return a harmless (if slightly misleading) "unmatched"
+result rather than a clear rejection. `stops.Handlers.RequestStop` now checks
+the route's `Source` explicitly and rejects a catalogue route with a `422`
+("this is a catalogue-imported route with no live vehicles — stop requests
+aren't available on it") **before** even loading its stops — an intentional,
+self-documenting guard rather than an incidental consequence of "no driver
+ever happens to be online there." The original coordinate-based guard
+(`stops.ErrCoordinatesUnknown`) is kept too, as defense-in-depth for the
+(now purely defensive) case of a genuinely coordinate-less stop on any
+route.
+
+### What's now map-capable vs. still missing
+
+- **Map-capable (new)**: catalogue stops and routes now carry real
+  (approximate, for stops) or real (exact, for polylines) geometry, and
+  `GET /stops` (the map-facing read, `routing.Repo.ListStopsWithCoordinates`)
+  now includes them alongside the 12 seeded stops — this is the intended
+  upgrade, not an oversight. `GET /routes/{id}/geometry` exposes each
+  catalogue route's real path for a future map to draw.
+- **Still NOT map/telemetry-capable in the ways that matter**: no vehicle
+  will ever go online on a catalogue route (no driver/vehicle data connects
+  the two), and live stop-request matching is explicitly blocked by source
+  (see above) — a catalogue route is real, browsable, and now drawable, but
+  never live.
+- **Still MISSING**: named intermediate stops (a polyline's ~394 vertices
+  are shape points from the source geometry, not boarding stops — every
+  catalogue route stays a single origin→destination leg, so multi-hop
+  search via a named catalogue interchange still isn't possible). Fares
+  remain ESTIMATED (see the original entry). Association sign-off is still
+  absent.
+
+### Provenance and the git/size decision
+
+**Copyright: Western Cape Government, Department of Transport and Public
+Works.** Dataset `SL_CGIS_TAXI_RTS`. Source API (reference only — never
+fetched at runtime): `https://citymaps.capetown.gov.za/agsext/rest/services/
+Theme_Based/ODP_SPLIT_6/FeatureServer/11` (serves EPSG:3857; the local file
+is a one-time export already reprojected to WGS84, which is the entire
+reason a local file is used instead of calling the API). All recorded in
+`backend/data/README.md` (new) and in `internal/catalogue`'s package doc
+comment.
+
+**`backend/data/taxi_routes.json` (~16MB) is gitignored, not committed** —
+added to the root `.gitignore`. Justification: it's large for a git repo
+with no LFS/cloud setup, it's static reference data that never changes at
+runtime (the importer only ever reads it), and it's trivially re-obtainable
+from the source API (or wherever the original copy came from) — not worth
+permanently bloating repository history with a 16MB blob. The original
+~70KB CSV stays committed (already was, costs nothing to keep as a small
+historical artifact). `backend/data/README.md` documents both files,
+provenance, and how to obtain the GeoJSON; `cmd/importcatalogue` errors with
+a pointer back to that README if the file is missing.
+
+### Row/coordinate counts (a clean import from the 8/12 baseline)
+
+```
+Source rows read:        1466
+Blank rows dropped:      19
+Unique ranks (folded):   549
+Routes imported (new):   1447
+Stops created (new):     549
+```
+
+Verified against the live database after import: 549 catalogue stops, **0**
+with `latitude IS NULL` (every rank got a median-derived coordinate — no
+orphans in either direction); 1447 `route_geometries` rows (one per
+catalogue route), averaging **395** points each (matches the source
+dataset's ~394 pts/route). `GET /stops` (unfiltered) returned exactly
+**561** stops (12 seed + 549 catalogue) with the full catalogue loaded —
+up from 12 before this upgrade, the intended change. After
+`cmd/clearcatalogue -apply`: back to exactly 8 routes / 12 stops / 0
+`route_geometries` rows, `cmd/cleanup`'s dry run still 0/0.
+
+### Tests
+
+- `internal/catalogue/median_test.go` (new, pure — no database):
+  `TestMedianCoordinate_ResistsOutliers` (a tight 5-point cluster plus one
+  wild outlier — the median lands on the cluster; explicitly asserts the
+  result is nowhere near the mean, which the outlier would have dragged
+  far away), `TestMedianCoordinate_SinglePoint`, `TestMedianCoordinate_
+  EvenCount`, and `TestPrepareRows_KnownRankGetsSaneCapeTownCoordinate` — a
+  live check against the real `taxi_routes.json` (skips if absent) that
+  `WYNBERG` and `CAPE TOWN STATION` both land within greater Cape Town's
+  bounding box. All pure computation, so none of this can ever touch or
+  risk a developer's real loaded catalogue.
+- `internal/catalogue/geojson.go`'s parsing behaviour re-verified via
+  `import_test.go`'s synthetic-fixture tests (rebuilt as small GeoJSON
+  FeatureCollections, replacing the retired CSV fixtures): blank-row drop,
+  directional/duplicate-distance distinctness, idempotency, and — new —
+  `TestImport_EveryCreatedStopHasACoordinate` (no orphans in either
+  direction) and `TestImport_MedianCoordinateResistsOutliers` (the same
+  outlier-resistance property, exercised through a real `Import` call and
+  the database, not just the pure function).
+- `internal/catalogue/normalize_test.go`'s real-data audit renamed
+  `TestNormalize_AgainstRealGeoJSON` and re-pointed at the GeoJSON — same
+  logic, unchanged normalization map, now reading `taxi_routes.json`.
+- `internal/routing/catalogue_repo_test.go`: new
+  `TestCreateCatalogueStop_TaggedCatalogueWithRealCoordinates`; `ListStopsWithCoordinates`'s
+  test renamed/extended (`TestListStopsWithCoordinates_MapFacingReadPath`) to
+  prove a catalogue stop WITH a coordinate is now included (the upgrade)
+  while a genuinely coordinate-less one still isn't; new
+  `TestRouteGeometry_StoredAndRetrievable`; the delete-scoping test rebuilt
+  around coordinate-bearing catalogue stops (`TestDeleteCatalogueData_
+  OnlyRemovesCatalogueRoutesStopsAndGeometry`) to actually prove the new
+  `source`-based scoping, not the coordinate-based one it silently used to.
+- `internal/stops/catalogue_test.go`: new
+  `TestRequestStop_CatalogueRouteWithRealCoordinatesStillRejected` proves the
+  new explicit source-based guard specifically (a catalogue route whose
+  stops DO have coordinates is still `422`'d); the original
+  `TestRequestStop_CoordinatelessRouteRejected` kept as-is for the
+  (now purely defensive) coordinate-based path.
+- Baseline check: `TestImport_DoesNotAffectSeedBaseline` extended to assert
+  both the seed-tagged **route** count and the seed-tagged **stop** count
+  are unaffected by an import (stops needed their own baseline check once
+  `stops.source` existed).
+
+Verified: `go build ./...`, `go vet ./...`, `gofmt -l .`, and `go mod tidy`
+all clean (no `go.mod`/`go.sum` diff — no new dependencies; geometry storage
+uses plain `encoding/json` + JSONB, no PostGIS/spatial library). Full suite
+(`go test ./...`) and `go test -race -count=1 ./...` (MSYS2 `ucrt64` gcc
+toolchain) both pass cleanly across every package, including every new/
+updated test above, with **zero regressions** and the untouched baseline
+(`go run ./cmd/seed` from the clean state still produces exactly 8 routes/12
+stops). End-to-end verified by hand against a live server with the REAL
+16MB GeoJSON: import produced the exact table above; `GET /stops`
+(unfiltered) returned 561 stops including a real catalogue stop with
+`"source":"catalogue"` and a genuine coordinate (e.g. `"3RD /7TH AVE
+MITCHELLS PLAIN"` at `-34.048953, 18.619164`); `GET /routes/search?from=
+BELLVILLE&to=DURBANVILLE` resolved a real catalogue route with
+`fare_estimated: true` and a haversine-computed `distance_meters`; `GET
+/routes/{id}/geometry` returned that route's real 261-point polyline while
+the same call against a hand-seeded corridor 404'd cleanly; `POST
+/stops/request` against the catalogue route's own (coordinate-bearing) stop
+was rejected `422` by the new source-based guard; and `cmd/clearcatalogue
+-apply` restored the database to exactly 8 routes / 12 stops / 0
+`route_geometries` rows, confirmed via direct query and via `cmd/cleanup`'s
+dry run still reporting 0/0.
+
+### PowerShell — load from GeoJSON, query (fare + coordinates + polyline), unload
+
+```powershell
+cd backend
+
+# 1. Load the real catalogue from the GeoJSON (opt-in, additive, idempotent).
+#    Requires backend/data/taxi_routes.json locally — see backend/data/README.md.
+go run ./cmd/importcatalogue
+
+# 2. Query a route showing its estimated fare, its stops' real coordinates,
+#    and its retrievable polyline. Run `go run ./cmd/server` in another
+#    terminal first.
+$search = Invoke-RestMethod "http://localhost:8080/routes/search?from=BELLVILLE&to=DURBANVILLE"
+$search.segments[0] | Select-Object route_name, fare_cents | Format-List
+$search.segments[0].legs[0] | Select-Object fare_cents, fare_estimated, distance_meters | Format-List
+
+$routeId = $search.segments[0].route_id
+Invoke-RestMethod "http://localhost:8080/routes/$routeId"     # source: "catalogue"
+
+# Confirm the route's endpoints now have real (approximate) coordinates —
+# GET /stops is map-facing and now includes catalogue stops too:
+$stops = Invoke-RestMethod "http://localhost:8080/stops"
+$stops.Count                                                    # -> 561 (12 seed + 549 catalogue)
+$stops | Where-Object { $_.name -eq "BELLVILLE" } | Format-List  # source: "catalogue", real lat/lng
+
+# Fetch the route's real polyline:
+$geometry = Invoke-RestMethod "http://localhost:8080/routes/$routeId/geometry"
+$geometry.point_count
+$geometry.points[0]     # first point
+$geometry.points[-1]    # last point
+
+# A hand-seeded corridor has no geometry — confirm the clean 404:
+$seedRouteId = (Invoke-RestMethod "http://localhost:8080/routes" | Where-Object { $_.source -eq "seed" } | Select-Object -First 1).id
+try { Invoke-RestMethod "http://localhost:8080/routes/$seedRouteId/geometry" } catch { $_.Exception.Response.StatusCode }
+
+# 3. Unload the catalogue back to the clean 8-corridor/12-stop baseline.
+go run ./cmd/clearcatalogue          # dry run — shows what would be removed
+go run ./cmd/clearcatalogue -apply   # actually removes it, including route_geometries
+```
+
+Next: Stage 9d — cross-cutting polish, or a frontend follow-up to render catalogue polylines (as directed)

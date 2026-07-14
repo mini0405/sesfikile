@@ -61,24 +61,26 @@ func TestNormalize_UnknownNamePassesThroughUnchanged(t *testing.T) {
 	}
 }
 
-// TestNormalize_AgainstRealCSV is a live audit of variantCanonical against
-// the actual source file: every raw variant spelling in the CSV is grouped
-// by a punctuation/whitespace-stripped key (preserving word order), and any
-// group with more than one distinct raw spelling must either (a) collapse
-// to one canonical name after Normalize, or (b) be a documented,
-// deliberately-not-folded exception. This is what keeps the map in
-// normalize.go honest against the real data, not just the hand-picked cases
-// above.
-func TestNormalize_AgainstRealCSV(t *testing.T) {
-	f, err := os.Open("../../data/taxi_routes.csv")
+// TestNormalize_AgainstRealGeoJSON is a live audit of variantCanonical
+// against the actual source file: every raw variant spelling in the dataset
+// is grouped by a punctuation/whitespace-stripped key (preserving word
+// order), and any group with more than one distinct raw spelling must
+// either (a) collapse to one canonical name after Normalize, or (b) be a
+// documented, deliberately-not-folded exception. This is what keeps the map
+// in normalize.go honest against the real data, not just the hand-picked
+// cases above. Unchanged in substance from the retired CSV importer's
+// version of this test — same attributes, same normalization map, just a
+// different source file.
+func TestNormalize_AgainstRealGeoJSON(t *testing.T) {
+	f, err := os.Open("../../data/taxi_routes.json")
 	if err != nil {
-		t.Skipf("skipping: source CSV not found: %v", err)
+		t.Skipf("skipping: source GeoJSON not found: %v", err)
 	}
 	defer f.Close()
 
-	rows, _, err := ParseCSV(f)
+	rows, _, err := ParseGeoJSON(f)
 	if err != nil {
-		t.Fatalf("failed to parse source csv: %v", err)
+		t.Fatalf("failed to parse source geojson: %v", err)
 	}
 
 	raw := map[string]bool{}

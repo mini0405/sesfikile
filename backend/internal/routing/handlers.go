@@ -104,12 +104,18 @@ func (h *Handlers) ListRoutes(w http.ResponseWriter, r *http.Request) {
 type stopResponse struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
-	// Latitude/Longitude are null for a catalogue-imported stop (the source
-	// CSV has no coordinates at all — see internal/catalogue). Check
-	// CoordinatesKnown before using either, never assume (0, 0).
+	// Latitude/Longitude are null only for a coordinate-less stop (a
+	// defensive edge case — see internal/catalogue). A catalogue-imported
+	// stop normally DOES have a coordinate since the GeoJSON upgrade, but
+	// it's an APPROXIMATE (median-derived rank centroid) one, not surveyed —
+	// see Source. Check CoordinatesKnown before using either field, never
+	// assume (0, 0).
 	Latitude         *float64 `json:"latitude"`
 	Longitude        *float64 `json:"longitude"`
 	CoordinatesKnown bool     `json:"coordinates_known"`
+	// Source is "seed" (exact, hand-placed coordinates) or "catalogue"
+	// (approximate, median-derived) — see internal/catalogue.
+	Source string `json:"source"`
 }
 
 func toStopResponse(s Stop) stopResponse {
@@ -119,6 +125,7 @@ func toStopResponse(s Stop) stopResponse {
 		Latitude:         s.Latitude,
 		Longitude:        s.Longitude,
 		CoordinatesKnown: s.CoordinatesKnown(),
+		Source:           s.Source,
 	}
 }
 
@@ -127,9 +134,12 @@ func toStopResponse(s Stop) stopResponse {
 // commuter should be able to see the stop list before logging in.
 //
 // With no route_id, this is the MAP-FACING read: every stop WITH KNOWN
-// COORDINATES, alphabetical (Repo.ListStopsWithCoordinates) — a
-// catalogue-imported stop (internal/catalogue) has none and is excluded
-// here, so nothing consuming this list for a map ever tries to place a
+// COORDINATES, alphabetical (Repo.ListStopsWithCoordinates). Since the
+// GeoJSON upgrade (internal/catalogue) a catalogue-imported stop normally
+// HAS one (an APPROXIMATE, median-derived rank centroid — see
+// stopResponse.Source) and so is now included here too; the only stops
+// still excluded are genuinely coordinate-less ones (a defensive edge
+// case), so nothing consuming this list for a map ever tries to place a
 // marker at an unknown/zero position. With route_id, it returns that
 // specific route's own stops in physical sequence order regardless of
 // whether their coordinates are known — a browse/search use (picking a
@@ -228,6 +238,50 @@ func (h *Handlers) GetRoute(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, routeDetailResponse{Route: toRouteResponse(route), Legs: legResp})
+}
+
+type geometryResponse struct {
+	RouteID    string `json:"route_id"`
+	PointCount int    `json:"point_count"`
+	// Points is [lon, lat] pairs, WGS84 — matches GeoJSON coordinate order
+	// (and Leaflet's L.polyline, once a frontend consumes this: swap to
+	// [lat, lon] there, same as any GeoJSON-to-Leaflet conversion).
+	Points [][2]float64 `json:"points"`
+}
+
+// GetRouteGeometry handles GET /routes/{id}/geometry — a catalogue-imported
+// route's real display polyline (internal/catalogue, the GeoJSON upgrade).
+// A hand-seeded route has no geometry recorded and 404s here, same as an
+// unknown route id — this endpoint doesn't distinguish "route doesn't
+// exist" from "route exists but has no geometry" in its status code, only
+// in the message, since neither case has anything useful to draw.
+func (h *Handlers) GetRouteGeometry(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "id must be a valid uuid")
+		return
+	}
+
+	if _, err := h.repo.GetRouteByID(r.Context(), id); err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusNotFound, "route not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load route")
+		return
+	}
+
+	points, err := h.repo.GetRouteGeometry(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			writeError(w, http.StatusNotFound, "no geometry recorded for this route (likely a hand-seeded corridor, not a catalogue import)")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load route geometry")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, geometryResponse{RouteID: id.String(), PointCount: len(points), Points: points})
 }
 
 type segmentResponse struct {

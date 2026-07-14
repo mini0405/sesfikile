@@ -9,10 +9,12 @@ import (
 	"sesfikile/backend/internal/routing"
 )
 
-// TestCreateStopNoCoordinates_CoordinatesUnknown confirms a catalogue-style
-// stop reports CoordinatesKnown() == false and round-trips through
-// GetStopByID/GetStopByName with nil Latitude/Longitude, while an ordinary
-// (cmd/seed-style) stop is unaffected.
+// TestCreateStopNoCoordinates_CoordinatesUnknown confirms a defensive
+// coordinate-less stop (the fallback internal/catalogue's importer would
+// use if a rank somehow had no endpoint sample) reports
+// CoordinatesKnown() == false, is tagged source='catalogue', and
+// round-trips through GetStopByID/GetStopByName with nil Latitude/Longitude,
+// while an ordinary (cmd/seed-style) stop is unaffected.
 func TestCreateStopNoCoordinates_CoordinatesUnknown(t *testing.T) {
 	repo, pool := setup(t)
 	ctx := context.Background()
@@ -29,6 +31,9 @@ func TestCreateStopNoCoordinates_CoordinatesUnknown(t *testing.T) {
 	}
 	if noCoords.Latitude != nil || noCoords.Longitude != nil {
 		t.Fatalf("expected nil Latitude/Longitude, got %v/%v", noCoords.Latitude, noCoords.Longitude)
+	}
+	if noCoords.Source != routing.SourceCatalogue {
+		t.Fatalf("expected CreateStopNoCoordinates to tag source=%q, got %q", routing.SourceCatalogue, noCoords.Source)
 	}
 
 	reloaded, err := repo.GetStopByID(ctx, noCoords.ID)
@@ -47,20 +52,51 @@ func TestCreateStopNoCoordinates_CoordinatesUnknown(t *testing.T) {
 	if !withCoords.CoordinatesKnown() {
 		t.Fatal("expected an ordinary (real-coordinate) stop to report CoordinatesKnown() == true")
 	}
+	if withCoords.Source != routing.SourceSeed {
+		t.Fatalf("expected CreateStop to default source=%q, got %q", routing.SourceSeed, withCoords.Source)
+	}
 }
 
-// TestListStopsWithCoordinates_ExcludesCoordinatelessStops is the
-// map-facing read path's core guarantee: a coordinate-less
-// (catalogue-style) stop never appears in ListStopsWithCoordinates, while a
-// real-coordinate stop does — and ListStops (the unfiltered/route-scoped
-// variant) still returns both.
-func TestListStopsWithCoordinates_ExcludesCoordinatelessStops(t *testing.T) {
+// TestCreateCatalogueStop_TaggedCatalogueWithRealCoordinates is the
+// GeoJSON-upgrade path: a catalogue stop now gets a real (if approximate)
+// coordinate, tagged source='catalogue' — distinguishable from a
+// hand-seeded stop by source, not by coordinate presence anymore.
+func TestCreateCatalogueStop_TaggedCatalogueWithRealCoordinates(t *testing.T) {
+	repo, pool := setup(t)
+	ctx := context.Background()
+	suffix := time.Now().UnixNano()
+
+	stop, err := repo.CreateCatalogueStop(ctx, fmt.Sprintf("Catalogue Repo Test Median Stop %d", suffix), -33.95, 18.45)
+	if err != nil {
+		t.Fatalf("failed to create catalogue stop: %v", err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM stops WHERE id = $1`, stop.ID) })
+
+	if !stop.CoordinatesKnown() {
+		t.Fatal("expected a catalogue stop created with a coordinate to report CoordinatesKnown() == true")
+	}
+	if stop.Source != routing.SourceCatalogue {
+		t.Fatalf("expected source=%q, got %q", routing.SourceCatalogue, stop.Source)
+	}
+	if *stop.Latitude != -33.95 || *stop.Longitude != 18.45 {
+		t.Fatalf("expected lat/lng -33.95/18.45, got %v/%v", *stop.Latitude, *stop.Longitude)
+	}
+}
+
+// TestListStopsWithCoordinates_MapFacingReadPath confirms the map-facing
+// read includes any stop with a known position REGARDLESS of source — a
+// catalogue stop with a real (median-derived) coordinate is included, same
+// as a hand-seeded one, while a coordinate-less stop (the defensive
+// fallback case) is excluded. ListStops (unfiltered/route-scoped) still
+// returns all three.
+func TestListStopsWithCoordinates_MapFacingReadPath(t *testing.T) {
 	repo, pool := setup(t)
 	ctx := context.Background()
 	suffix := time.Now().UnixNano()
 
 	noCoordsName := fmt.Sprintf("Catalogue Repo Test NoCoords %d", suffix)
-	withCoordsName := fmt.Sprintf("Catalogue Repo Test WithCoords %d", suffix)
+	catWithCoordsName := fmt.Sprintf("Catalogue Repo Test CatWithCoords %d", suffix)
+	seedWithCoordsName := fmt.Sprintf("Catalogue Repo Test SeedWithCoords %d", suffix)
 
 	noCoords, err := repo.CreateStopNoCoordinates(ctx, noCoordsName)
 	if err != nil {
@@ -68,11 +104,17 @@ func TestListStopsWithCoordinates_ExcludesCoordinatelessStops(t *testing.T) {
 	}
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM stops WHERE id = $1`, noCoords.ID) })
 
-	withCoords, err := repo.CreateStop(ctx, withCoordsName, -33.9, 18.4)
+	catWithCoords, err := repo.CreateCatalogueStop(ctx, catWithCoordsName, -33.9, 18.4)
+	if err != nil {
+		t.Fatalf("failed to create catalogue stop with coordinates: %v", err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM stops WHERE id = $1`, catWithCoords.ID) })
+
+	seedWithCoords, err := repo.CreateStop(ctx, seedWithCoordsName, -33.91, 18.41)
 	if err != nil {
 		t.Fatalf("failed to create ordinary stop: %v", err)
 	}
-	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM stops WHERE id = $1`, withCoords.ID) })
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM stops WHERE id = $1`, seedWithCoords.ID) })
 
 	mapFacing, err := repo.ListStopsWithCoordinates(ctx)
 	if err != nil {
@@ -85,8 +127,11 @@ func TestListStopsWithCoordinates_ExcludesCoordinatelessStops(t *testing.T) {
 	if seenMapFacing[noCoordsName] {
 		t.Fatal("expected the map-facing stop list to EXCLUDE the coordinate-less stop")
 	}
-	if !seenMapFacing[withCoordsName] {
-		t.Fatal("expected the map-facing stop list to INCLUDE the real-coordinate stop")
+	if !seenMapFacing[catWithCoordsName] {
+		t.Fatal("expected the map-facing stop list to INCLUDE the catalogue stop that has a coordinate — the intended GeoJSON upgrade")
+	}
+	if !seenMapFacing[seedWithCoordsName] {
+		t.Fatal("expected the map-facing stop list to INCLUDE the hand-seeded stop")
 	}
 
 	full, err := repo.ListStops(ctx)
@@ -97,8 +142,8 @@ func TestListStopsWithCoordinates_ExcludesCoordinatelessStops(t *testing.T) {
 	for _, s := range full {
 		seenFull[s.Name] = true
 	}
-	if !seenFull[noCoordsName] || !seenFull[withCoordsName] {
-		t.Fatal("expected the unfiltered/route-scoped ListStops to still include both stops")
+	if !seenFull[noCoordsName] || !seenFull[catWithCoordsName] || !seenFull[seedWithCoordsName] {
+		t.Fatal("expected the unfiltered/route-scoped ListStops to include all three stops")
 	}
 }
 
@@ -138,11 +183,63 @@ func TestCatalogueRoute_TaggedDistinctlyFromSeedRoute(t *testing.T) {
 	}
 }
 
-// TestDeleteCatalogueData_OnlyRemovesCatalogueRoutesAndOrphanedStops is the
+// TestRouteGeometry_StoredAndRetrievable confirms a route's polyline
+// round-trips through CreateRouteGeometry/GetRouteGeometry exactly, and
+// that a route with none returns ErrNotFound rather than an empty slice
+// (distinguishing "no geometry recorded" from "recorded as empty").
+func TestRouteGeometry_StoredAndRetrievable(t *testing.T) {
+	repo, pool := setup(t)
+	ctx := context.Background()
+	suffix := time.Now().UnixNano()
+
+	route, err := repo.CreateCatalogueRoute(ctx, fmt.Sprintf("Catalogue Repo Test Geometry Route %d", suffix), "City of Cape Town open data (unverified, no association attribution)")
+	if err != nil {
+		t.Fatalf("failed to create route: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx := context.Background()
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM route_geometries WHERE route_id = $1`, route.ID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM routes WHERE id = $1`, route.ID)
+	})
+
+	points := [][2]float64{{18.4241, -33.9249}, {18.43, -33.93}, {18.44, -33.94}}
+	if err := repo.CreateRouteGeometry(ctx, route.ID, points); err != nil {
+		t.Fatalf("failed to store geometry: %v", err)
+	}
+
+	got, err := repo.GetRouteGeometry(ctx, route.ID)
+	if err != nil {
+		t.Fatalf("failed to retrieve geometry: %v", err)
+	}
+	if len(got) != len(points) {
+		t.Fatalf("expected %d points, got %d", len(points), len(got))
+	}
+	for i := range points {
+		if got[i] != points[i] {
+			t.Errorf("point %d: expected %v, got %v", i, points[i], got[i])
+		}
+	}
+
+	// A route with no geometry (e.g. a hand-seeded corridor) must report
+	// ErrNotFound, not an empty slice.
+	bareRoute, err := repo.CreateRoute(ctx, fmt.Sprintf("Catalogue Repo Test No Geometry Route %d", suffix), "Test Association")
+	if err != nil {
+		t.Fatalf("failed to create bare route: %v", err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM routes WHERE id = $1`, bareRoute.ID) })
+
+	if _, err := repo.GetRouteGeometry(ctx, bareRoute.ID); !isNotFound(err) {
+		t.Fatalf("expected ErrNotFound for a route with no stored geometry, got %v", err)
+	}
+}
+
+// TestDeleteCatalogueData_OnlyRemovesCatalogueRoutesStopsAndGeometry is the
 // clear/undo path's safety guarantee: a hand-seeded (source='seed') route
-// and its stops survive; a catalogue route, its leg, and its now-orphaned
-// coordinate-less stops do not.
-func TestDeleteCatalogueData_OnlyRemovesCatalogueRoutesAndOrphanedStops(t *testing.T) {
+// and its stops survive; a catalogue route, its leg, its geometry, and its
+// now-orphaned catalogue stops (WITH real median-derived coordinates, the
+// post-GeoJSON-upgrade normal case — no longer identifiable by having no
+// coordinates) do not.
+func TestDeleteCatalogueData_OnlyRemovesCatalogueRoutesStopsAndGeometry(t *testing.T) {
 	repo, pool := setup(t)
 	ctx := context.Background()
 	suffix := time.Now().UnixNano()
@@ -170,13 +267,14 @@ func TestDeleteCatalogueData_OnlyRemovesCatalogueRoutesAndOrphanedStops(t *testi
 		_, _ = pool.Exec(cleanupCtx, `DELETE FROM stops WHERE id IN ($1, $2)`, seedFrom.ID, seedTo.ID)
 	})
 
-	// A catalogue route that must be removed, along with its now-orphaned
-	// coordinate-less stops.
-	catFrom, err := repo.CreateStopNoCoordinates(ctx, fmt.Sprintf("Delete Test Cat From %d", suffix))
+	// A catalogue route (WITH real, median-style coordinates on its stops —
+	// the post-upgrade normal case) that must be removed, along with its
+	// geometry and its now-orphaned stops.
+	catFrom, err := repo.CreateCatalogueStop(ctx, fmt.Sprintf("Delete Test Cat From %d", suffix), -33.95, 18.45)
 	if err != nil {
 		t.Fatalf("failed to create catalogue from-stop: %v", err)
 	}
-	catTo, err := repo.CreateStopNoCoordinates(ctx, fmt.Sprintf("Delete Test Cat To %d", suffix))
+	catTo, err := repo.CreateCatalogueStop(ctx, fmt.Sprintf("Delete Test Cat To %d", suffix), -33.96, 18.46)
 	if err != nil {
 		t.Fatalf("failed to create catalogue to-stop: %v", err)
 	}
@@ -187,23 +285,30 @@ func TestDeleteCatalogueData_OnlyRemovesCatalogueRoutesAndOrphanedStops(t *testi
 	if _, err := repo.CreateCatalogueRouteLeg(ctx, catRoute.ID, catFrom.ID, catTo.ID, 900, 12345.6); err != nil {
 		t.Fatalf("failed to create catalogue leg: %v", err)
 	}
+	if err := repo.CreateRouteGeometry(ctx, catRoute.ID, [][2]float64{{18.45, -33.95}, {18.46, -33.96}}); err != nil {
+		t.Fatalf("failed to store catalogue geometry: %v", err)
+	}
 
-	routesDeleted, legsDeleted, stopsDeleted, err := repo.DeleteCatalogueData(ctx)
+	routesDeleted, legsDeleted, stopsDeleted, geometriesDeleted, err := repo.DeleteCatalogueData(ctx)
 	if err != nil {
 		t.Fatalf("DeleteCatalogueData failed: %v", err)
 	}
-	if routesDeleted < 1 || legsDeleted < 1 || stopsDeleted < 2 {
-		t.Fatalf("expected at least 1 route, 1 leg, 2 stops deleted; got routes=%d legs=%d stops=%d", routesDeleted, legsDeleted, stopsDeleted)
+	if routesDeleted < 1 || legsDeleted < 1 || stopsDeleted < 2 || geometriesDeleted < 1 {
+		t.Fatalf("expected at least 1 route, 1 leg, 2 stops, 1 geometry deleted; got routes=%d legs=%d stops=%d geometries=%d",
+			routesDeleted, legsDeleted, stopsDeleted, geometriesDeleted)
 	}
 
 	if _, err := repo.GetRouteByID(ctx, catRoute.ID); !isNotFound(err) {
 		t.Fatalf("expected catalogue route to be gone, got err=%v", err)
 	}
+	if _, err := repo.GetRouteGeometry(ctx, catRoute.ID); !isNotFound(err) {
+		t.Fatalf("expected catalogue route's geometry to be gone, got err=%v", err)
+	}
 	if _, err := repo.GetStopByID(ctx, catFrom.ID); !isNotFound(err) {
-		t.Fatalf("expected orphaned catalogue from-stop to be gone, got err=%v", err)
+		t.Fatalf("expected orphaned catalogue from-stop (with real coordinates) to be gone, got err=%v", err)
 	}
 	if _, err := repo.GetStopByID(ctx, catTo.ID); !isNotFound(err) {
-		t.Fatalf("expected orphaned catalogue to-stop to be gone, got err=%v", err)
+		t.Fatalf("expected orphaned catalogue to-stop (with real coordinates) to be gone, got err=%v", err)
 	}
 
 	// The seed-tagged fixture must be completely unaffected.

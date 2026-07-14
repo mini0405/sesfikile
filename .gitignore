@@ -5,3 +5,10 @@ dist/
 *.env
 .DS_Store
 *.log
+
+# Large third-party open-data export (~16MB) — the opt-in route catalogue
+# importer's source file (backend/internal/catalogue, cmd/importcatalogue).
+# See backend/data/README.md for provenance and how to obtain it; not worth
+# bloating repo history with a 16MB blob that's easy to re-fetch and never
+# changes at runtime (the importer only ever reads it, never writes it).
+backend/data/taxi_routes.json

@@ -125,8 +125,20 @@ func (h *Handlers) RequestStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := h.routingRepo.GetRouteByID(r.Context(), routeID); err != nil {
+	route, err := h.routingRepo.GetRouteByID(r.Context(), routeID)
+	if err != nil {
 		writeError(w, http.StatusNotFound, "route not found")
+		return
+	}
+	if route.Source == routing.SourceCatalogue {
+		// Explicit, intentional guard — not just a consequence of no driver
+		// ever being online on a catalogue route. Since the GeoJSON upgrade
+		// (internal/catalogue) a catalogue route's stops DO have coordinates,
+		// so the coordinate check below would no longer by itself block one;
+		// live stop-request matching still has no place on a route with no
+		// real vehicles, so it's rejected by source instead.
+		writeError(w, http.StatusUnprocessableEntity,
+			"this is a catalogue-imported route with no live vehicles — stop requests aren't available on it")
 		return
 	}
 	legs, err := h.routingRepo.ListLegsForRoute(r.Context(), routeID)
