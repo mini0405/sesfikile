@@ -32,10 +32,14 @@ type routeResponse struct {
 	ID              string `json:"id"`
 	Name            string `json:"name"`
 	AssociationName string `json:"association_name"`
+	// Source is "seed" (cmd/seed's hand-seeded demo corridors) or
+	// "catalogue" (cmd/importcatalogue's real-but-unverified City of Cape
+	// Town rows) — see internal/catalogue.
+	Source string `json:"source"`
 }
 
 func toRouteResponse(r Route) routeResponse {
-	return routeResponse{ID: r.ID.String(), Name: r.Name, AssociationName: r.AssociationName}
+	return routeResponse{ID: r.ID.String(), Name: r.Name, AssociationName: r.AssociationName, Source: r.Source}
 }
 
 type legResponse struct {
@@ -47,18 +51,26 @@ type legResponse struct {
 	ToStopID     string `json:"to_stop_id"`
 	ToStopName   string `json:"to_stop_name"`
 	FareCents    int64  `json:"fare_cents"`
+	// FareEstimated is true only for a catalogue-imported leg: its
+	// fare_cents was derived from distance (internal/catalogue.
+	// EstimateFareCents), NOT an actual association tariff. Always false
+	// for every hand-seeded leg.
+	FareEstimated  bool     `json:"fare_estimated"`
+	DistanceMeters *float64 `json:"distance_meters,omitempty"`
 }
 
 func toLegResponse(l RouteLeg, stops map[uuid.UUID]Stop) legResponse {
 	return legResponse{
-		ID:           l.ID.String(),
-		RouteID:      l.RouteID.String(),
-		Sequence:     l.Sequence,
-		FromStopID:   l.FromStopID.String(),
-		FromStopName: stops[l.FromStopID].Name,
-		ToStopID:     l.ToStopID.String(),
-		ToStopName:   stops[l.ToStopID].Name,
-		FareCents:    l.FareCents,
+		ID:             l.ID.String(),
+		RouteID:        l.RouteID.String(),
+		Sequence:       l.Sequence,
+		FromStopID:     l.FromStopID.String(),
+		FromStopName:   stops[l.FromStopID].Name,
+		ToStopID:       l.ToStopID.String(),
+		ToStopName:     stops[l.ToStopID].Name,
+		FareCents:      l.FareCents,
+		FareEstimated:  l.FareEstimated,
+		DistanceMeters: l.DistanceMeters,
 	}
 }
 
@@ -90,29 +102,43 @@ func (h *Handlers) ListRoutes(w http.ResponseWriter, r *http.Request) {
 }
 
 type stopResponse struct {
-	ID        string  `json:"id"`
-	Name      string  `json:"name"`
-	Latitude  float64 `json:"latitude"`
-	Longitude float64 `json:"longitude"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Latitude/Longitude are null for a catalogue-imported stop (the source
+	// CSV has no coordinates at all — see internal/catalogue). Check
+	// CoordinatesKnown before using either, never assume (0, 0).
+	Latitude         *float64 `json:"latitude"`
+	Longitude        *float64 `json:"longitude"`
+	CoordinatesKnown bool     `json:"coordinates_known"`
 }
 
 func toStopResponse(s Stop) stopResponse {
-	return stopResponse{ID: s.ID.String(), Name: s.Name, Latitude: s.Latitude, Longitude: s.Longitude}
+	return stopResponse{
+		ID:               s.ID.String(),
+		Name:             s.Name,
+		Latitude:         s.Latitude,
+		Longitude:        s.Longitude,
+		CoordinatesKnown: s.CoordinatesKnown(),
+	}
 }
 
 // ListStops handles GET /stops and GET /stops?route_id=<id>. Public read,
 // consistent with /routes being public reference data (Stage 3) — a
 // commuter should be able to see the stop list before logging in.
 //
-// With no route_id, it returns every stop, alphabetical (same ordering as
-// Repo.ListStops/ListRoutes). With route_id, it returns that route's own
-// stops in physical sequence order — derived from the route's ordered legs,
-// not alphabetical — which is what a commuter app needs to build
-// from/to pickers that can't produce an invalid (out-of-sequence) pair.
+// With no route_id, this is the MAP-FACING read: every stop WITH KNOWN
+// COORDINATES, alphabetical (Repo.ListStopsWithCoordinates) — a
+// catalogue-imported stop (internal/catalogue) has none and is excluded
+// here, so nothing consuming this list for a map ever tries to place a
+// marker at an unknown/zero position. With route_id, it returns that
+// specific route's own stops in physical sequence order regardless of
+// whether their coordinates are known — a browse/search use (picking a
+// from/to pair on one named route) that never needs a position, so a
+// catalogue route's endpoints are still browsable here.
 func (h *Handlers) ListStops(w http.ResponseWriter, r *http.Request) {
 	routeIDParam := r.URL.Query().Get("route_id")
 	if routeIDParam == "" {
-		stops, err := h.repo.ListStops(r.Context())
+		stops, err := h.repo.ListStopsWithCoordinates(r.Context())
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "failed to list stops")
 			return

@@ -2563,3 +2563,272 @@ cd ..\apps\driver;   npm install; npx tsc --noEmit; npm run build; npm run dev
 cd ..\apps\commuter; npm install; npx tsc --noEmit; npm run build; npm run dev
 cd ..\apps\owner;    npm install; npx tsc --noEmit; npm run build; npm run dev
 ```
+
+---
+
+## Real route catalogue import (opt-in) — DONE (2026-07-14)
+
+Backend-only, additive, **opt-in** — nothing here runs unless `cmd/importcatalogue`
+is invoked by hand. `cmd/seed`'s hand-seeded 8-corridor/12-stop baseline is
+byte-for-byte unchanged and is still exactly what a fresh `go run ./cmd/seed`
+produces; every catalogue-imported row is tagged `source='catalogue'` (routes)
+or has `latitude/longitude = NULL` (stops), both structurally distinguishable
+from — and independently removable from — the seeded baseline. No frontend
+apps touched.
+
+**Input**: `backend/data/taxi_routes.csv` — a real City of Cape Town open-data
+export, `OBJECTID, ORGN, DSTN, SHAPE_Length` columns, 1466 data rows.
+
+### What's REAL, ESTIMATED, and MISSING (SCOPE HONESTY)
+
+- **REAL**: origin rank name, destination rank name, route distance in
+  metres. Directional pairs (A→B and B→A) and "VIA `<x>`" variants are kept
+  as genuinely distinct routes, never deduplicated — including ~223
+  origin/destination pairs that appear more than once in the source data
+  with a *different* distance each time (up to 13× for one pair); every one
+  of these becomes its own route, traceable back to its exact source row via
+  the source CSV's own `OBJECTID`, embedded directly in the route name
+  (`"<ORIGIN> - <DESTINATION> (CoCT #<OBJECTID>)"`) — this is also what makes
+  re-running the importer idempotent.
+- **ESTIMATED**: every catalogue route's fare. The source CSV carries **no
+  fare data whatsoever** — `internal/catalogue.EstimateFareCents` derives an
+  indicative fare from distance (`base + per-km rate`, rounded, clamped to a
+  configurable `[min, max]`; defaults R5.00 base + R1.50/km, R6.00–R60.00 —
+  all overridable via `CATALOGUE_FARE_{BASE,PER_KM,MIN,MAX}_CENTS` env vars,
+  `internal/config.CatalogueFareModel`). Every such leg is flagged
+  `fare_estimated: true` in `route_legs`/the API response, and both
+  `cmd/importcatalogue`'s own printed output and this entry state plainly:
+  **this is not an actual association tariff — real fares require
+  association tariff data, which does not exist as an input to this MVP.**
+- **MISSING**:
+  - **Coordinates.** The source CSV has no lat/lng anywhere. Every
+    catalogue-imported stop is created with `latitude`/`longitude = NULL`
+    (`routing.Repo.CreateStopNoCoordinates`; `stops.latitude`/`longitude`
+    are now nullable, paired by a `CHECK` constraint) and reports
+    `Stop.CoordinatesKnown() == false`. Consequence, enforced in code, not
+    just documented: catalogue stops/routes **cannot** appear on the live
+    Leaflet map or in telemetry.
+    - `GET /stops` (no `route_id` — the *map-facing* read) now calls the new
+      `routing.Repo.ListStopsWithCoordinates`, which excludes every
+      coordinate-less stop, so nothing consuming the unfiltered list for a
+      map ever tries to place a marker at an unknown/zero position. Verified
+      end-to-end: with all 1447 catalogue routes/549 catalogue stops loaded,
+      `GET /stops` still returns exactly the 12 real seeded stops.
+      `GET /stops?route_id=<id>` (the route-scoped browse/search read) is
+      unaffected and still returns a catalogue route's own two stops —
+      picking a from/to pair on a named route never needs a position.
+    - `stops.Handlers.loadRouteStops` (Stage 6's request-a-stop matching,
+      the other "telemetry read path" the brief called out) now checks
+      `CoordinatesKnown()` for every stop on the requested route and returns
+      a new `stops.ErrCoordinatesUnknown` if any lack one; `RequestStop`
+      turns this into a clean `422` ("this route has no known stop
+      coordinates … and cannot be used for live stop requests") rather than
+      silently computing haversine distance against a nil position. Covered
+      by `internal/stops/catalogue_test.go`'s
+      `TestRequestStop_CoordinatelessRouteRejected`.
+  - **Intermediate stops.** Only endpoints are known per source row, so every
+    catalogue route is exactly **one leg** (`sequence = 1`,
+    `routing.Repo.CreateCatalogueRouteLeg`) — no in-between stops to infer.
+  - **Association sign-off.** Every catalogue route's `association_name` is
+    the literal string `"City of Cape Town open data (unverified, no
+    association attribution)"` (`internal/catalogue.CatalogueAssociationName`)
+    — visibly distinct from the seeded corridors' real "Cape Town Minibus
+    Taxi Association" label, so nobody mistakes one for the other.
+
+### Built
+
+- **Schema** (`backend/migrations/000005_route_catalogue.{up,down}.sql`),
+  purely additive, every new column defaulting to what the existing
+  hand-seeded rows already are:
+  - `stops.latitude`/`longitude` — `NOT NULL` dropped, plus a
+    `stops_coordinates_paired CHECK ((latitude IS NULL) = (longitude IS
+    NULL))` so a stop can never end up with only half a coordinate.
+  - `routes.source TEXT NOT NULL DEFAULT 'seed' CHECK (source IN ('seed',
+    'catalogue'))`, indexed.
+  - `route_legs.distance_meters DOUBLE PRECISION` (nullable — the source
+    CSV's own `SHAPE_Length`, kept for traceability) and
+    `route_legs.fare_estimated BOOLEAN NOT NULL DEFAULT false`.
+- `internal/routing`:
+  - `Stop.Latitude`/`Longitude` are now `*float64`; new
+    `Stop.CoordinatesKnown() bool`. `Route` gained `Source string`
+    (`SourceSeed`/`SourceCatalogue` constants); `RouteLeg` gained
+    `DistanceMeters *float64`/`FareEstimated bool`.
+  - New `Repo` methods: `CreateStopNoCoordinates`, `ListStopsWithCoordinates`
+    (the map-facing read), `CountStopsWithoutCoordinates`,
+    `CreateCatalogueRoute`, `CreateCatalogueRouteLeg`, `CountRoutesBySource`,
+    and `DeleteCatalogueData` (one transaction: catalogue routes' legs →
+    catalogue routes → any now-orphaned coordinate-less stop — never matches
+    a `source='seed'` row or a stop with known coordinates, by construction).
+    Every existing `CreateStop`/`CreateRoute`/`CreateRouteLeg` call site
+    (`cmd/seed`, all prior tests) is unaffected — same signatures, same
+    defaults.
+  - `handlers.go`: `routeResponse` gained `source`; `legResponse` gained
+    `fare_estimated`/`distance_meters` (omitted if unset); `stopResponse`
+    gained `latitude`/`longitude` as nullable + `coordinates_known` — all
+    additive JSON fields, no existing field renamed or removed.
+- `internal/stops`: new `ErrCoordinatesUnknown`; `loadRouteStops` /
+  `RequestStop` updated as described above.
+- **`internal/catalogue`** (new package) — the importer itself:
+  - `csv.go` — `ParseCSV`: BOM-tolerant, relies on `encoding/csv` for RFC
+    4180 quoted-comma handling (no hand-rolled splitting), drops
+    blank-ORGN/DSTN rows (counted, not silently discarded), keeps a handful
+    of genuine same-origin/destination rows (rank-internal loop routes —
+    real, not a parsing error).
+  - `normalize.go` — `Normalize` + the small, hand-reviewed
+    `variantCanonical` map (see "Conservative normalization" below).
+  - `fare.go` — `EstimateFareCents` (see "ESTIMATED" above).
+  - `import.go` — `Import`: idempotent load into `routing.Repo`, tagged
+    `SourceCatalogue`; `routeName` embeds the source `OBJECTID`.
+  - `clear.go` — `Clear`: thin wrapper over `Repo.DeleteCatalogueData`.
+- `cmd/importcatalogue` — `go run ./cmd/importcatalogue [-csv path]`
+  (default `data/taxi_routes.csv`, i.e. run from `backend/`). Applies
+  migrations, imports, prints a real/estimated/missing summary plus row
+  counts. Idempotent.
+- `cmd/clearcatalogue` — mirrors `cmd/cleanup`'s shape exactly: dry-run by
+  default (prints what would be removed), `-apply` to actually delete.
+  Removes only `source='catalogue'` routes/legs and now-orphaned
+  coordinate-less stops — structurally cannot touch the seeded baseline.
+
+### Conservative normalization — the reviewable map
+
+Built by grouping every unique raw rank name in the source CSV by a
+punctuation/whitespace-stripped key (uppercase, strip every non-alphanumeric
+character, **preserve word order**) — 24 groups came out with more than one
+raw spelling. Every one was hand-reviewed and confirmed to be a TRUE
+punctuation/spacing/apostrophe variant of the *same* physical rank, in the
+*same* word order (e.g. `MITCHELL'S PLAIN` / `MITCHELLS PLAIN`,
+`SANLAM CENTRE,PAROW` / `SANLAM CENTRE ,PAROW` / `SANLAM CENTRE PAROW`,
+`HOUTBAY` / `HOUT BAY`) — never two genuinely different ranks, and never a
+reordering of words (judged too big a leap for an auditable, mechanical
+rule). `internal/catalogue/normalize.go`'s `variantCanonical` map folds
+exactly those 24 groups and nothing else; its doc comment documents both the
+folded groups and the deliberately-NOT-folded near-misses (the ten distinct
+"KHAYELITSHA (…)" ranks; `"MITCHELLS PLAIN (TOWN CENTRE)"` vs `"TOWN CENTRE,
+MITCHELLS PLAIN"` and `"PAROW SANLAM CENTRE"` vs `"SANLAM CENTRE, PAROW"` —
+both reversed-word-order pairs, kept distinct). `internal/catalogue/
+normalize_test.go`'s `TestNormalize_AgainstRealCSV` re-runs this exact
+grouping live against the real CSV on every test run and fails if any
+unfolded multi-spelling group appears that isn't this documented set — the
+map can't silently drift out of sync with the source data.
+
+### Row counts (a clean import from the 8/12 baseline)
+
+```
+Source rows read:        1466
+Blank rows dropped:      19
+Unique ranks (folded):   549    (576 raw spellings, 24 groups folded)
+Routes imported (new):   1447
+Stops created (new):     549
+```
+
+Verified against the live database after import: `routes` has exactly 8
+`source='seed'` + 1447 `source='catalogue'` rows; `stops` has exactly 12
+with real coordinates + 549 with `latitude IS NULL`. After
+`cmd/clearcatalogue -apply`: back to exactly 8 routes / 12 stops, `cmd/
+cleanup`'s dry run still reports 0/0 (unrelated test-junk sweep, unaffected).
+
+### Tests
+
+- `internal/catalogue/csv_test.go` — quoted-comma + BOM parsing, blank-row
+  drop counted correctly, a same-origin/destination row kept (not dropped),
+  malformed `OBJECTID`/short rows error cleanly.
+- `internal/catalogue/normalize_test.go` — known variants fold to their
+  documented canonical form; the brief's own conservative-folding
+  non-negotiable (`KHAYELITSHA` / `KHAYELITSHA SITE C` / reversed-order pairs
+  stay distinct); an unfamiliar name passes through untouched; the live
+  audit against the real CSV described above.
+- `internal/catalogue/fare_test.go` — base+per-km math, rounding to the
+  nearest cent, min/max clamping (including the real dataset's actual
+  shortest/longest distances), never negative.
+- `internal/catalogue/import_test.go` (real Postgres, skips if unreachable
+  like every other DB-backed test in this repo; cleans up only its own
+  uniquely-suffixed rows via targeted `DELETE ... WHERE name LIKE`, **never**
+  a blanket catalogue sweep, since this runs against the same shared dev
+  database a developer might have a real import loaded in) — parses +
+  tags `source='catalogue'` correctly (fare_estimated, distance_meters,
+  coordinate-less stops all asserted), directional pairs and same-pair
+  duplicate-distance rows create genuinely distinct routes, re-import is
+  fully idempotent (second run: 0 new routes/stops), and a catalogue import
+  never changes the `source='seed'` route count.
+- `internal/routing/catalogue_repo_test.go` — `CreateStopNoCoordinates`
+  round-trips with nil lat/lng, `ListStopsWithCoordinates` excludes a
+  coordinate-less stop while including a real one (and the unfiltered
+  `ListStops` still includes both), `CreateRoute` vs `CreateCatalogueRoute`
+  tag `source` correctly, and `DeleteCatalogueData` removes a catalogue
+  fixture while leaving a hand-seeded fixture completely untouched.
+- `internal/stops/catalogue_test.go` —
+  `TestRequestStop_CoordinatelessRouteRejected`: a route built from
+  `CreateStopNoCoordinates`/`CreateCatalogueRoute` (exactly what the importer
+  produces) is cleanly `422`'d by `POST /stops/request`, not silently
+  matched against a zero position.
+
+### Decisions / deviations
+
+- **Route naming embeds the source `OBJECTID`** rather than a positional
+  disambiguation counter — simpler, and every catalogue route stays
+  individually traceable back to its exact source row, which a counter
+  wouldn't give for free.
+- **No cross-linking between catalogue and seeded stops**, even when a name
+  would coincide (e.g. seed's `"Wynberg"` vs a hypothetical catalogue
+  `"WYNBERG"`): catalogue names are stored exactly as normalized (upper
+  case), seed names keep their existing Title Case, so the two never collide
+  by construction. Deliberate — merging them would risk attaching real
+  coordinates/telemetry expectations to a catalogue stop, or vice versa.
+- **`stops.latitude`/`longitude` went nullable** (rather than a separate
+  `coordinates_known` boolean) — one less column to keep in sync;
+  `Stop.CoordinatesKnown()` is the single call site everything reads through.
+- **Fare model lives in `internal/config`**, matching every other
+  configurable-but-not-a-real-external-feed value in this codebase (fuel
+  price/litre, fare split) — env-overridable, sane dev defaults, never
+  pretending to be a real tariff.
+
+Verified: `go build ./...`, `go vet ./...`, `gofmt -l .`, and `go mod tidy`
+all clean (no `go.mod`/`go.sum` diff — no new dependencies). Full suite
+(`go test ./...`) and `go test -race -count=1 ./...` (MSYS2 `ucrt64` gcc
+toolchain) both pass cleanly across every package, including every new test
+above, with **zero regressions in any prior stage's tests** and the
+untouched baseline (`go run ./cmd/seed` from a clean volume still produces
+exactly 8 routes/12 stops). End-to-end verified by hand against a live
+server: seeded the baseline, ran the real importer (1466 rows → 1447 routes,
+549 stops, exactly as tabulated above), confirmed `GET /routes/search`
+resolves a real catalogue route (`BELLVILLE → DURBANVILLE`, direct,
+`fare_estimated: true`, real `distance_meters`), confirmed `GET /stops`
+(unfiltered) still returns exactly the 12 real seeded stops with the full
+catalogue loaded, confirmed `GET /routes/{id}` shows the catalogue route's
+`source: "catalogue"` and distinct association label, then ran
+`cmd/clearcatalogue -apply` and confirmed the database was back to exactly
+8 routes / 12 stops with `cmd/cleanup` still reporting a clean 0/0.
+
+### PowerShell — load, query, unload
+
+```powershell
+cd backend
+
+# 1. Load the real catalogue (opt-in, additive, idempotent).
+go run ./cmd/importcatalogue
+
+# 2. Query real catalogue routes via the EXISTING /routes* endpoints — no
+#    new endpoints were added. Run `go run ./cmd/server` in another terminal
+#    first.
+Invoke-RestMethod "http://localhost:8080/routes/search?from=BELLVILLE&to=DURBANVILLE"
+Invoke-RestMethod "http://localhost:8080/routes/search?from=KHAYELITSHA&to=NYANGA"
+
+# GET /routes still returns everything (8 seed + however many catalogue
+# routes are loaded) — filter client-side on "source" if you just want one:
+(Invoke-RestMethod "http://localhost:8080/routes") | Where-Object { $_.source -eq "catalogue" } | Select-Object -First 5
+
+# Pull one real route's full detail (fare_estimated + distance_meters):
+$bellville = (Invoke-RestMethod "http://localhost:8080/routes/search?from=BELLVILLE&to=DURBANVILLE").segments[0].route_id
+Invoke-RestMethod "http://localhost:8080/routes/$bellville"
+
+# GET /stops (unfiltered) stays exactly the 12 real seeded stops even with
+# the full catalogue loaded — catalogue stops have no coordinates and are
+# excluded from this map-facing read by design.
+(Invoke-RestMethod "http://localhost:8080/stops").Count   # -> 12
+
+# 3. Unload the catalogue back to the clean 8-corridor/12-stop baseline.
+go run ./cmd/clearcatalogue          # dry run — shows what would be removed
+go run ./cmd/clearcatalogue -apply   # actually removes it
+```
+
+Next: Stage 9d — cross-cutting polish (or further backend/frontend work, as directed)

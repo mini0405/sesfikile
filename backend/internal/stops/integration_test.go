@@ -155,9 +155,9 @@ func seedRoute(t *testing.T, env *testEnv) routeFixture {
 
 	return routeFixture{
 		RouteID: route.ID.String(), OriginID: origin.ID.String(), MidID: mid.ID.String(), DestID: dest.ID.String(),
-		OriginLat: origin.Latitude, OriginLng: origin.Longitude,
-		MidLat: mid.Latitude, MidLng: mid.Longitude,
-		DestLat: dest.Latitude, DestLng: dest.Longitude,
+		OriginLat: *origin.Latitude, OriginLng: *origin.Longitude,
+		MidLat: *mid.Latitude, MidLng: *mid.Longitude,
+		DestLat: *dest.Latitude, DestLng: *dest.Longitude,
 	}
 }
 

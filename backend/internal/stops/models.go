@@ -8,10 +8,18 @@
 package stops
 
 import (
+	"errors"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+// ErrCoordinatesUnknown means a route's stops can't be used for live
+// stop-request matching because at least one of them has no known position
+// — always a catalogue-imported route (internal/catalogue), whose stops
+// come from a source CSV with no coordinates at all. Never true for any
+// hand-seeded route.
+var ErrCoordinatesUnknown = errors.New("stop coordinates unknown")
 
 // Status is a stop-request's lifecycle state.
 type Status string

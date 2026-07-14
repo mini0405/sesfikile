@@ -29,6 +29,27 @@ type Config struct {
 	// FuelPricePerLitreCents converts litres <-> cents for the MOCK VIU
 	// authorize endpoint — a configurable price, not a real fuel-price feed.
 	FuelPricePerLitreCents int64
+	// CatalogueFare configures internal/catalogue's distance-derived fare
+	// estimate for the opt-in real route catalogue import
+	// (cmd/importcatalogue). Not a real tariff — see CatalogueFareModel.
+	CatalogueFare CatalogueFareModel
+}
+
+// CatalogueFareModel derives an INDICATIVE fare (int64 cents) for an
+// opt-in, catalogue-imported route (internal/catalogue) from its
+// straight-line distance in metres: base + per-kilometre rate, rounded to
+// the nearest cent, clamped to [MinFareCents, MaxFareCents]. This is NOT a
+// real association tariff — the source CSV (backend/data/taxi_routes.csv)
+// carries no fare data at all. Every fare this produces is stored with
+// fare_estimated = true (routes.route_legs) and must be presented
+// everywhere as "estimated from distance, not an actual association fare."
+// Real fares require association tariff data, which does not exist as an
+// input to this MVP.
+type CatalogueFareModel struct {
+	BaseCents    int64
+	PerKmCents   int64
+	MinFareCents int64
+	MaxFareCents int64
 }
 
 func Load() Config {
@@ -48,6 +69,12 @@ func Load() Config {
 		FuelWithholdPct:    getEnvInt("FUEL_WITHHOLD_PCT", 30),
 		// R22.00/litre — a plausible dev-only default, not a live price feed.
 		FuelPricePerLitreCents: int64(getEnvInt("FUEL_PRICE_PER_LITRE_CENTS", 2200)),
+		CatalogueFare: CatalogueFareModel{
+			BaseCents:    int64(getEnvInt("CATALOGUE_FARE_BASE_CENTS", 500)),
+			PerKmCents:   int64(getEnvInt("CATALOGUE_FARE_PER_KM_CENTS", 150)),
+			MinFareCents: int64(getEnvInt("CATALOGUE_FARE_MIN_CENTS", 600)),
+			MaxFareCents: int64(getEnvInt("CATALOGUE_FARE_MAX_CENTS", 6000)),
+		},
 	}
 }
 

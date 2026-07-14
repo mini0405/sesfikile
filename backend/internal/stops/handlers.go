@@ -73,7 +73,14 @@ func (h *Handlers) loadRouteStops(ctx context.Context, legs []routing.RouteLeg) 
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, RouteStop{StopID: stop.ID, Lat: stop.Latitude, Lng: stop.Longitude})
+		if !stop.CoordinatesKnown() {
+			// Always a catalogue-imported stop (internal/catalogue) — its
+			// source CSV has no coordinates at all. Live stop-request
+			// matching needs a real position, so bail cleanly rather than
+			// treating an unknown position as (0, 0).
+			return nil, ErrCoordinatesUnknown
+		}
+		result = append(result, RouteStop{StopID: stop.ID, Lat: *stop.Latitude, Lng: *stop.Longitude})
 	}
 	return result, nil
 }
@@ -129,6 +136,11 @@ func (h *Handlers) RequestStop(w http.ResponseWriter, r *http.Request) {
 	}
 	routeStops, err := h.loadRouteStops(r.Context(), legs)
 	if err != nil {
+		if errors.Is(err, ErrCoordinatesUnknown) {
+			writeError(w, http.StatusUnprocessableEntity,
+				"this route has no known stop coordinates (likely an imported catalogue route with no map data) and cannot be used for live stop requests")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "failed to load route stops")
 		return
 	}
