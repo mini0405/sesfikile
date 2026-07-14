@@ -2347,3 +2347,86 @@ go run ./cmd/cleanup -apply
 # Confirm cmd/seed's summary is clean again (only the 8 real corridors)
 go run ./cmd/seed
 ```
+
+---
+
+## Fix the fuel anti-bypass flake — DONE (2026-07-14)
+
+No feature changes; test-isolation only, following up on the housekeeping
+pass above, which flagged but deliberately did not fix
+`internal/fuel/fuel_test.go`'s `TestAntiBypass_FuelFundsNeverReachWalletOrPayout`
+as a separate, pre-existing flake and worked around it with `-p 1` for that
+pass's own verification. This entry fixes it properly so a bare `go test
+./...`/`go test -race ./...` (no `-p 1`) pass reliably.
+
+**Root cause**: the test read *global* aggregate state instead of its own
+fixture's rows — `SUM(amount_cents)` across **every** `commuter_wallet` /
+`driver_earnings` account in the database, the balance of the **one**
+shared `funding_source` system account, and `COUNT(*)` over **all**
+`ledger_postings` in the whole table. Under `go test ./...`'s default
+cross-package parallelism, other packages (`wallet`, `boarding`, `stops`,
+`analytics`) are concurrently topping up and charging real commuter/driver
+wallets — and every `Topup` anywhere debits the same singleton
+`funding_source` account by construction (Stage 2: at most one system
+account per type) — against the same persistent dev Postgres, so any of
+those global reads could change between this test's "before" and "after"
+snapshots for reasons that have nothing to do with fuel logic.
+
+**Fix — same guarantee, isolated data source, per the brief's own suggested
+approach ("assert on the transaction/posting structure of its own isolated
+operations rather than on a global balance snapshot")**:
+  - `mustCreateFundedOwnerVehicle` (used by every other test in the file)
+    is untouched. A new `mustCreateFundedOwnerVehicleFull` — same body, same
+    unique-per-call identifiers every DB-backed test in this repo already
+    uses — additionally returns the driver's and commuter's own user ids in
+    a `fundedFixture` struct; the plain two-value helper is now a thin
+    wrapper around it. Only the anti-bypass test calls the full form; the
+    other 11 call sites in the file are unchanged.
+  - `env.postingCount()` (global `COUNT(*) FROM ledger_postings`) replaced
+    by `env.scopedPostingCount(ownerUserIDs...)` —
+    `COUNT(*) ... WHERE a.owner_user_id = ANY($1)`. Called with exactly this
+    test's own owner/driver/commuter user ids. This is safe under
+    concurrency for two reasons: the shared system accounts
+    (`funding_source`, `platform_fee`) have `owner_user_id IS NULL` and can
+    never match an `ANY()` filter over non-null ids, and no other test in
+    the suite knows these single-test-unique ids, so only this test's own
+    calls can move the count.
+  - `totalAcrossAccountType()` (global `SUM` per account *type*) removed —
+    the commuter_wallet/driver_earnings before/after checks now call the
+    existing `env.accountBalance(t, &fx.CommuterID, ...)` /
+    `env.accountBalance(t, &fx.DriverUserID, ...)` helper (already used
+    elsewhere in this file for the owner's own accounts), which was already
+    scoped by `owner_user_id` — it just hadn't been pointed at this
+    fixture's driver/commuter ids before.
+  - The `funding_source`-balance before/after check (the one truly
+    un-scopable read — there is exactly one such account, shared by the
+    whole test binary) is replaced with a **structural** check on the one
+    ledger transaction this flow is allowed to create: new
+    `assertTransactionOnlyTouchesAccountTypes(t, env, allocateTxn.ID,
+    wallet.AccountOwnerRevenue, wallet.AccountFuelAccount)` queries exactly
+    that transaction's own posting rows (scoped by `transaction_id`, not a
+    balance) and asserts the set of account types touched is exactly
+    `{owner_revenue, fuel_account}` — which is strictly stronger than the
+    old check (it rules out `funding_source` *and* `platform_fee` *and*
+    `commuter_wallet` *and* `driver_earnings` in one assertion, not just
+    `funding_source`), and is completely immune to concurrent writes
+    anywhere else in the database since it only ever reads rows tied to
+    `allocateTxn.ID`, an id only this test's own `Allocate` call produced.
+  - Net result: every read in this test is now keyed by an id (`account.
+    owner_user_id` or `ledger_transaction.id`) that only this test's own
+    fixture/operations could have produced — the guarantee proved
+    ("`FundVehicleQuota`/`AuthorizePump`/`ConfirmPump` add zero postings;
+    `Allocate` touches only `owner_revenue`/`fuel_account`; this fixture's
+    own `commuter_wallet`/`driver_earnings` never move") is identical to
+    before, only which rows get read changed.
+
+Verified: `go build ./...`, `go vet ./...`, `gofmt -l .`, `go mod tidy` all
+clean (no `go.mod`/`go.sum` diff). `go test -count=1 -v
+./internal/fuel/...` passes in full, including the rewritten anti-bypass
+test alone and alongside the rest of the package's tests. Acceptance bar
+from the brief — **no `-p 1`, run twice each**:
+`go test -count=1 ./...` (green both times) and `go test -race -count=1
+./...` (green both times, MSYS2 `ucrt64` gcc toolchain, same as prior race
+runs) — all four runs passed cleanly against the same live, not-reset
+Postgres, with zero flakes. Route/stop counts stayed at exactly 8/12
+throughout (no regression on the housekeeping pass above).

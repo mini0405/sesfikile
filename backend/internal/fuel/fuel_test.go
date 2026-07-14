@@ -74,13 +74,26 @@ func uniqueStr(prefix string) string {
 	return fmt.Sprintf("+27%d%d%s", time.Now().UnixNano(), n, prefix)
 }
 
-// mustCreateFundedOwnerVehicle creates an owner, a driver, a vehicle
+// fundedFixture is the full set of identities mustCreateFundedOwnerVehicleFull
+// creates — everything mustCreateFundedOwnerVehicle's (Owner, Vehicle) pair
+// omits. Most tests in this file only need the owner/vehicle; the
+// anti-bypass test also needs the driver's and commuter's own user ids so it
+// can scope its assertions to exactly the accounts this one test's fixture
+// owns, rather than reading account state shared with every other package's
+// tests running concurrently against the same dev Postgres.
+type fundedFixture struct {
+	Owner        identity.User
+	Vehicle      identity.Vehicle
+	DriverUserID uuid.UUID
+	CommuterID   uuid.UUID
+}
+
+// mustCreateFundedOwnerVehicleFull creates an owner, a driver, a vehicle
 // assigned to that driver, and a commuter — then charges revenueCents worth
 // of fares from the commuter through the vehicle, so the owner's
 // owner_revenue balance ends up non-zero (the real precondition for
-// /fuel/allocate to have anything to withhold). Returns the owner user and
-// the vehicle.
-func mustCreateFundedOwnerVehicle(t *testing.T, env *testEnv, revenueCents int64) (identity.User, identity.Vehicle) {
+// /fuel/allocate to have anything to withhold).
+func mustCreateFundedOwnerVehicleFull(t *testing.T, env *testEnv, revenueCents int64) fundedFixture {
 	t.Helper()
 	ctx := context.Background()
 
@@ -129,7 +142,15 @@ func mustCreateFundedOwnerVehicle(t *testing.T, env *testEnv, revenueCents int64
 		t.Fatalf("test setup: expected owner_revenue %d, computed split gave %d (fareCents=%d)", revenueCents, split.OwnerCents, fareCents)
 	}
 
-	return owner, vehicle
+	return fundedFixture{Owner: owner, Vehicle: vehicle, DriverUserID: driverUser.ID, CommuterID: commuter.ID}
+}
+
+// mustCreateFundedOwnerVehicle is the (Owner, Vehicle)-only convenience form
+// every test but the anti-bypass one uses.
+func mustCreateFundedOwnerVehicle(t *testing.T, env *testEnv, revenueCents int64) (identity.User, identity.Vehicle) {
+	t.Helper()
+	fx := mustCreateFundedOwnerVehicleFull(t, env, revenueCents)
+	return fx.Owner, fx.Vehicle
 }
 
 func (env *testEnv) accountBalance(t *testing.T, ownerUserID *uuid.UUID, accountType wallet.AccountType) int64 {
@@ -146,13 +167,72 @@ func (env *testEnv) accountBalance(t *testing.T, ownerUserID *uuid.UUID, account
 	return bal
 }
 
-func (env *testEnv) postingCount(t *testing.T) int {
+// scopedPostingCount counts ledger_postings against exactly the accounts
+// owned by ownerUserIDs (accounts.owner_user_id) — never a global count
+// across every account in the database. This is what makes it safe to use
+// from a test running concurrently with every other package's DB-backed
+// tests against the same persistent dev Postgres: the shared system
+// accounts (funding_source, platform_fee) have owner_user_id NULL and can
+// never match this filter, and no other test in the suite knows these
+// specific, single-test-unique user ids, so only this test's own operations
+// can move this count.
+func (env *testEnv) scopedPostingCount(t *testing.T, ownerUserIDs ...uuid.UUID) int {
 	t.Helper()
 	var n int
-	if err := env.pool.QueryRow(context.Background(), `SELECT COUNT(*) FROM ledger_postings`).Scan(&n); err != nil {
-		t.Fatalf("failed to count postings: %v", err)
+	if err := env.pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM ledger_postings lp
+		 JOIN accounts a ON a.id = lp.account_id
+		 WHERE a.owner_user_id = ANY($1::uuid[])`,
+		ownerUserIDs,
+	).Scan(&n); err != nil {
+		t.Fatalf("failed to count scoped postings: %v", err)
 	}
 	return n
+}
+
+// assertTransactionOnlyTouchesAccountTypes asserts transactionID's postings
+// exist against exactly wantTypes (as a set) — a structural check on this
+// one transaction's own posting rows, not a global balance snapshot, so it
+// can't be perturbed by concurrent activity elsewhere in the database.
+func assertTransactionOnlyTouchesAccountTypes(t *testing.T, env *testEnv, transactionID uuid.UUID, wantTypes ...wallet.AccountType) {
+	t.Helper()
+	rows, err := env.pool.Query(context.Background(),
+		`SELECT a.type FROM ledger_postings lp
+		 JOIN accounts a ON a.id = lp.account_id
+		 WHERE lp.transaction_id = $1
+		 ORDER BY a.type`,
+		transactionID,
+	)
+	if err != nil {
+		t.Fatalf("failed to load transaction account types: %v", err)
+	}
+	defer rows.Close()
+
+	got := map[wallet.AccountType]bool{}
+	for rows.Next() {
+		var accType wallet.AccountType
+		if err := rows.Scan(&accType); err != nil {
+			t.Fatalf("failed to scan account type: %v", err)
+		}
+		got[accType] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("failed to read transaction account types: %v", err)
+	}
+
+	want := map[wallet.AccountType]bool{}
+	for _, wt := range wantTypes {
+		want[wt] = true
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("transaction %s touches account types %v, want exactly %v", transactionID, got, want)
+	}
+	for wt := range want {
+		if !got[wt] {
+			t.Fatalf("transaction %s touches account types %v, want exactly %v", transactionID, got, want)
+		}
+	}
 }
 
 // --- Withholding (real ledger) -------------------------------------------
@@ -420,72 +500,79 @@ func TestConfirmPump_UnknownReference_NotFound(t *testing.T) {
 // ConfirmPump never add a single new ledger_postings row (only Allocate
 // does), which is the structural guarantee that fuel value cannot be
 // cashed back out through the ledger.
+//
+// ISOLATION: this test used to read global state — SUM(amount_cents) across
+// every commuter_wallet/driver_earnings account in the database, and the
+// balance of the one shared funding_source system account — which made it
+// flaky under `go test ./...`'s default cross-package parallelism, since
+// other packages' tests are concurrently topping up/charging real wallets
+// (and the ONE shared funding_source account, by construction) against the
+// same persistent dev Postgres. It now only ever inspects: (a) postings
+// scoped to this fixture's own owner/driver/commuter user ids
+// (scopedPostingCount, via accounts.owner_user_id — no other test in the
+// suite knows these single-test-unique ids, and the shared system accounts
+// have owner_user_id NULL so can never match this filter), and (b) the
+// account-type structure of the one transaction Allocate itself returns
+// (assertTransactionOnlyTouchesAccountTypes) rather than a before/after
+// snapshot of the shared funding_source balance. The guarantee proved is
+// identical — none of these operations touch funding_source or this
+// fixture's own commuter_wallet/driver_earnings accounts — only which rows
+// get read changed.
 func TestAntiBypass_FuelFundsNeverReachWalletOrPayout(t *testing.T) {
 	env := setup(t)
-	owner, vehicle := mustCreateFundedOwnerVehicle(t, env, 10000)
+	fx := mustCreateFundedOwnerVehicleFull(t, env, 10000)
+	fixtureOwnerIDs := []uuid.UUID{fx.Owner.ID, fx.DriverUserID, fx.CommuterID}
 
-	commuterWalletBefore := totalAcrossAccountType(t, env, wallet.AccountCommuterWallet)
-	driverEarningsBefore := totalAcrossAccountType(t, env, wallet.AccountDriverEarnings)
-	fundingSourceBefore := env.accountBalance(t, nil, wallet.AccountFundingSource)
+	commuterWalletBefore := env.accountBalance(t, &fx.CommuterID, wallet.AccountCommuterWallet)
+	driverEarningsBefore := env.accountBalance(t, &fx.DriverUserID, wallet.AccountDriverEarnings)
+	postingsBefore := env.scopedPostingCount(t, fixtureOwnerIDs...)
 
-	if _, _, err := env.fuel.Allocate(context.Background(), owner.ID, 30); err != nil {
+	allocateTxn, _, err := env.fuel.Allocate(context.Background(), fx.Owner.ID, 30)
+	if err != nil {
 		t.Fatalf("allocate failed: %v", err)
 	}
-	postingsAfterAllocate := env.postingCount(t)
 
-	if _, err := env.fuel.FundVehicleQuota(context.Background(), owner.ID, vehicle.ID, 2000); err != nil {
+	// Allocate is the only step in this flow allowed to add a posting, and
+	// its transaction must touch exactly owner_revenue and fuel_account —
+	// never funding_source, commuter_wallet, driver_earnings, or
+	// platform_fee. A structural check on this one transaction's own
+	// posting rows, not a global balance read.
+	assertTransactionOnlyTouchesAccountTypes(t, env, allocateTxn.ID, wallet.AccountOwnerRevenue, wallet.AccountFuelAccount)
+
+	postingsAfterAllocate := env.scopedPostingCount(t, fixtureOwnerIDs...)
+	if postingsAfterAllocate != postingsBefore+2 {
+		t.Fatalf("expected Allocate to add exactly 2 postings (owner_revenue debit + fuel_account credit) to this fixture's own accounts, went from %d to %d", postingsBefore, postingsAfterAllocate)
+	}
+
+	if _, err := env.fuel.FundVehicleQuota(context.Background(), fx.Owner.ID, fx.Vehicle.ID, 2000); err != nil {
 		t.Fatalf("fund quota failed: %v", err)
 	}
-	if env.postingCount(t) != postingsAfterAllocate {
-		t.Fatal("FundVehicleQuota must not create any new ledger postings — it only earmarks already-withheld fuel_account funds")
+	if got := env.scopedPostingCount(t, fixtureOwnerIDs...); got != postingsAfterAllocate {
+		t.Fatalf("FundVehicleQuota must not create any new ledger postings — it only earmarks already-withheld fuel_account funds (went from %d to %d)", postingsAfterAllocate, got)
 	}
 
-	auth, err := env.fuel.AuthorizePump(context.Background(), vehicle.ID, 90, 2000)
+	auth, err := env.fuel.AuthorizePump(context.Background(), fx.Vehicle.ID, 90, 2000)
 	if err != nil || !auth.Authorized {
 		t.Fatalf("authorize failed: %+v, %v", auth, err)
 	}
-	if env.postingCount(t) != postingsAfterAllocate {
-		t.Fatal("AuthorizePump must not create any new ledger postings — it only reserves quota")
+	if got := env.scopedPostingCount(t, fixtureOwnerIDs...); got != postingsAfterAllocate {
+		t.Fatalf("AuthorizePump must not create any new ledger postings — it only reserves quota (went from %d to %d)", postingsAfterAllocate, got)
 	}
 
 	if _, err := env.fuel.ConfirmPump(context.Background(), auth.AuthReference); err != nil {
 		t.Fatalf("confirm failed: %v", err)
 	}
-	if env.postingCount(t) != postingsAfterAllocate {
-		t.Fatal("ConfirmPump must not create any new ledger postings — settling a quota reservation is not a ledger event")
+	if got := env.scopedPostingCount(t, fixtureOwnerIDs...); got != postingsAfterAllocate {
+		t.Fatalf("ConfirmPump must not create any new ledger postings — settling a quota reservation is not a ledger event (went from %d to %d)", postingsAfterAllocate, got)
 	}
 
-	commuterWalletAfter := totalAcrossAccountType(t, env, wallet.AccountCommuterWallet)
-	driverEarningsAfter := totalAcrossAccountType(t, env, wallet.AccountDriverEarnings)
-	fundingSourceAfter := env.accountBalance(t, nil, wallet.AccountFundingSource)
+	commuterWalletAfter := env.accountBalance(t, &fx.CommuterID, wallet.AccountCommuterWallet)
+	driverEarningsAfter := env.accountBalance(t, &fx.DriverUserID, wallet.AccountDriverEarnings)
 
 	if commuterWalletAfter != commuterWalletBefore {
-		t.Fatalf("commuter_wallet total changed from %d to %d — fuel operations must never touch commuter wallets", commuterWalletBefore, commuterWalletAfter)
+		t.Fatalf("this fixture's commuter_wallet changed from %d to %d — fuel operations must never touch commuter wallets", commuterWalletBefore, commuterWalletAfter)
 	}
 	if driverEarningsAfter != driverEarningsBefore {
-		t.Fatalf("driver_earnings total changed from %d to %d — fuel operations must never touch driver payouts", driverEarningsBefore, driverEarningsAfter)
+		t.Fatalf("this fixture's driver_earnings changed from %d to %d — fuel operations must never touch driver payouts", driverEarningsBefore, driverEarningsAfter)
 	}
-	if fundingSourceAfter != fundingSourceBefore {
-		t.Fatalf("funding_source changed from %d to %d — fuel operations must never touch the funding source", fundingSourceBefore, fundingSourceAfter)
-	}
-}
-
-// totalAcrossAccountType sums every posting against every account of the
-// given type — used by the anti-bypass test to prove fuel operations never
-// move value into any commuter_wallet/driver_earnings account, not just the
-// one belonging to this test's own fixtures.
-func totalAcrossAccountType(t *testing.T, env *testEnv, accountType wallet.AccountType) int64 {
-	t.Helper()
-	var total int64
-	err := env.pool.QueryRow(context.Background(),
-		`SELECT COALESCE(SUM(lp.amount_cents), 0)
-		 FROM ledger_postings lp
-		 JOIN accounts a ON a.id = lp.account_id
-		 WHERE a.type = $1`,
-		accountType,
-	).Scan(&total)
-	if err != nil {
-		t.Fatalf("failed to sum postings for account type %s: %v", accountType, err)
-	}
-	return total
 }
