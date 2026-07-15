@@ -10,10 +10,19 @@ export interface AuthResponse {
   role: Role;
 }
 
+// Source distinguishes cmd/seed's hand-seeded, live-vehicle-capable
+// corridors ("seed") from cmd/importcatalogue's real-but-browse-only City of
+// Cape Town rows ("catalogue") — see backend/internal/catalogue and
+// docs/PROGRESS.md's "Real route catalogue import" entries. No vehicle will
+// ever go online on a catalogue route; treat "catalogue" as ride-able-never,
+// not ride-able-later.
+export type RouteSource = "seed" | "catalogue";
+
 export interface Route {
   id: string;
   name: string;
   association_name: string;
+  source: RouteSource;
 }
 
 export interface RouteLeg {
@@ -25,6 +34,10 @@ export interface RouteLeg {
   to_stop_id: string;
   to_stop_name: string;
   fare_cents: number;
+  // True only for a catalogue-imported leg: fare_cents was derived from
+  // distance (internal/catalogue.EstimateFareCents), not an actual
+  // association tariff. Always false for a hand-seeded leg.
+  fare_estimated: boolean;
 }
 
 export interface RouteDetail {
@@ -35,6 +48,14 @@ export interface RouteDetail {
 export interface Stop {
   id: string;
   name: string;
+  // Null only for a genuinely coordinate-less stop (a defensive edge case).
+  // A catalogue-imported stop normally HAS a coordinate since the GeoJSON
+  // upgrade, but it's an APPROXIMATE median-derived rank centroid, not
+  // surveyed — see source.
+  latitude: number | null;
+  longitude: number | null;
+  coordinates_known: boolean;
+  source: RouteSource;
 }
 
 export interface RouteSearchSegment {
@@ -42,6 +63,16 @@ export interface RouteSearchSegment {
   route_name: string;
   legs: RouteLeg[];
   fare_cents: number;
+}
+
+// One route's stored display polyline, decimated server-side for the bulk
+// "network coverage" read (GET /routes/geometries) — see api.client's
+// getRouteGeometries. Points are [lon, lat] pairs (GeoJSON order); swap to
+// [lat, lon] for Leaflet.
+export interface RouteGeometrySummary {
+  route_id: string;
+  original_point_count: number;
+  points: [number, number][];
 }
 
 export interface RouteSearchResult {

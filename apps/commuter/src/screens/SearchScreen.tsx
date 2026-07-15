@@ -1,9 +1,11 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { api, ApiError } from "../api/client";
-import type { RouteSearchResult, Stop } from "../types";
+import { RouteSourceBadge } from "../components/RouteSourceBadge";
+import type { Route, RouteSearchResult, Stop } from "../types";
 
 interface SearchScreenProps {
   stops: Stop[];
+  routes: Route[];
   stopsLoading: boolean;
   stopsError: string | null;
   onViewRoute: (routeId: string) => void;
@@ -20,7 +22,41 @@ function orderedStopNames(result: RouteSearchResult): string[] {
   return names;
 }
 
-export function SearchScreen({ stops, stopsLoading, stopsError, onViewRoute }: SearchScreenProps) {
+/** Native <select> with <optgroup> — the pickers need to tell a live/seeded
+ * rank apart from a catalogue-only one (549 vs 12 once the catalogue is
+ * loaded) without hiding either, per this stage's brief: "don't hide the
+ * catalogue ranks — the coverage IS the story — just label them truthfully."
+ * Grouping rather than a badge-per-option keeps a 561-item list scannable;
+ * a native optgroup needs no extra dependency and works with plain <select>
+ * keyboard/screen-reader behaviour for free. */
+function StopOptions({ stops }: { stops: Stop[] }) {
+  const live = stops.filter((s) => s.source !== "catalogue");
+  const coverage = stops.filter((s) => s.source === "catalogue");
+  return (
+    <>
+      {live.length > 0 && (
+        <optgroup label="Live ranks">
+          {live.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.name}
+            </option>
+          ))}
+        </optgroup>
+      )}
+      {coverage.length > 0 && (
+        <optgroup label="Network coverage (browse only)">
+          {coverage.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.name}
+            </option>
+          ))}
+        </optgroup>
+      )}
+    </>
+  );
+}
+
+export function SearchScreen({ stops, routes, stopsLoading, stopsError, onViewRoute }: SearchScreenProps) {
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [result, setResult] = useState<RouteSearchResult | null>(null);
@@ -54,6 +90,9 @@ export function SearchScreen({ stops, stopsLoading, stopsError, onViewRoute }: S
   const toStop = stops.find((s) => s.id === to);
   const stopNames = result ? orderedStopNames(result) : [];
 
+  const routeById = useMemo(() => new Map(routes.map((r) => [r.id, r])), [routes]);
+  const resultIsCatalogue = result ? result.segments.some((seg) => routeById.get(seg.route_id)?.source === "catalogue") : false;
+
   return (
     <div className="mx-auto max-w-md px-4 pb-20 pt-6">
       <div className="mb-3 flex items-center justify-between">
@@ -79,11 +118,7 @@ export function SearchScreen({ stops, stopsLoading, stopsError, onViewRoute }: S
               <option value="" disabled>
                 {stopsLoading ? "Loading stops…" : "Select origin…"}
               </option>
-              {stops.map((s) => (
-                <option key={s.id} value={s.id} disabled={s.id === to}>
-                  {s.name}
-                </option>
-              ))}
+              <StopOptions stops={stops.filter((s) => s.id !== to)} />
             </select>
           </div>
 
@@ -97,11 +132,7 @@ export function SearchScreen({ stops, stopsLoading, stopsError, onViewRoute }: S
               <option value="" disabled>
                 {stopsLoading ? "Loading stops…" : "Select destination…"}
               </option>
-              {stops.map((s) => (
-                <option key={s.id} value={s.id} disabled={s.id === from}>
-                  {s.name}
-                </option>
-              ))}
+              <StopOptions stops={stops.filter((s) => s.id !== from)} />
             </select>
           </div>
 
@@ -129,18 +160,29 @@ export function SearchScreen({ stops, stopsLoading, stopsError, onViewRoute }: S
 
       {result && (
         <div className="ticket">
-          <div className="mb-4 flex items-center justify-between">
+          <div className="mb-4 flex items-start justify-between gap-2">
             <div>
-              <p className="board-heading mb-1">{result.transfers === 0 ? "Direct" : `${result.transfers} transfer`}</p>
+              <div className="mb-1 flex items-center gap-2">
+                <p className="board-heading">{result.transfers === 0 ? "Direct" : `${result.transfers} transfer`}</p>
+                {resultIsCatalogue && <RouteSourceBadge source="catalogue" compact />}
+              </div>
               <p className="text-sm font-bold">
                 {fromStop?.name} → {toStop?.name}
               </p>
             </div>
             <div className="text-right">
-              <p className="board-heading mb-1">Total fare</p>
+              <p className="board-heading mb-1">{resultIsCatalogue ? "Est. total fare" : "Total fare"}</p>
               <p className="font-display text-2xl font-black">R{(result.total_fare_cents / 100).toFixed(2)}</p>
             </div>
           </div>
+
+          {resultIsCatalogue && (
+            <p className="mb-4 rounded-sm border-2 border-dashed border-ink/30 bg-board-dim px-3 py-2 text-xs text-ink/70">
+              This trip runs on real City of Cape Town route data with no live vehicles tracked — browse only.
+              Fares are distance-estimated, not a confirmed association tariff, and boarding passes can&rsquo;t be
+              generated for it.
+            </p>
+          )}
 
           <div className="mb-4 space-y-1 border-y border-dashed border-ink/30 py-3">
             {stopNames.map((name, i) => (
@@ -158,22 +200,30 @@ export function SearchScreen({ stops, stopsLoading, stopsError, onViewRoute }: S
           </div>
 
           <div className="space-y-2">
-            {result.segments.map((seg, i) => (
-              <div key={seg.route_id}>
-                {i > 0 && (
-                  <p className="my-2 text-center text-[11px] font-bold uppercase tracking-wide text-marigold-700">
-                    ⟳ Transfer at {seg.legs[0]?.from_stop_name}
-                  </p>
-                )}
-                <button
-                  onClick={() => onViewRoute(seg.route_id)}
-                  className="flex w-full items-center justify-between rounded-sm border-2 border-ink/20 bg-board-dim px-3 py-2 text-left transition active:translate-y-px"
-                >
-                  <span className="text-sm font-bold text-ink">{seg.route_name}</span>
-                  <span className="text-xs font-bold text-ink/60">R{(seg.fare_cents / 100).toFixed(2)}</span>
-                </button>
-              </div>
-            ))}
+            {result.segments.map((seg, i) => {
+              const segSource = routeById.get(seg.route_id)?.source;
+              return (
+                <div key={seg.route_id}>
+                  {i > 0 && (
+                    <p className="my-2 text-center text-[11px] font-bold uppercase tracking-wide text-marigold-700">
+                      ⟳ Transfer at {seg.legs[0]?.from_stop_name}
+                    </p>
+                  )}
+                  <button
+                    onClick={() => onViewRoute(seg.route_id)}
+                    className="flex w-full items-center justify-between rounded-sm border-2 border-ink/20 bg-board-dim px-3 py-2 text-left transition active:translate-y-px"
+                  >
+                    <span className="flex min-w-0 items-center gap-2">
+                      <span className="truncate text-sm font-bold text-ink">{seg.route_name}</span>
+                      {segSource && <RouteSourceBadge source={segSource} compact />}
+                    </span>
+                    <span className="shrink-0 text-xs font-bold text-ink/60">
+                      R{(seg.fare_cents / 100).toFixed(2)}
+                    </span>
+                  </button>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}

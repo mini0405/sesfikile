@@ -1,43 +1,46 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "../api/client";
 import type { Route, RouteDetail, Stop } from "../types";
 
 interface RoutesData {
   routes: Route[];
   stops: Stop[];
-  routeDetails: Map<string, RouteDetail>;
   loading: boolean;
   error: string | null;
+  /** True once the catalogue import has been loaded (any stop tagged
+   * source: "catalogue") — derived from the already-fetched stop list, no
+   * extra request. Screens use this to degrade coverage/grouping features
+   * gracefully rather than erroring when the catalogue isn't imported. */
+  catalogueLoaded: boolean;
+  /** Fetches (and caches) one route's ordered legs on demand. Deliberately
+   * NOT prefetched for every route up front — with the catalogue loaded
+   * GET /routes can return 1400+ rows, and fetching each one's detail
+   * eagerly (as this hook originally did, back when it also used this as
+   * its only way to build a stop list) would mean over a thousand requests
+   * before the app was usable. A route's detail is now only ever fetched
+   * when a screen actually needs it (a tap in Routes/Board), then reused
+   * from this cache. */
+  getRouteDetail: (routeId: string) => Promise<RouteDetail | null>;
 }
 
-/**
- * There is no GET /stops endpoint (Stage 3 only ever needed from/to by id or
- * name) — so the commuter app derives the full stop list itself by fetching
- * every route's detail once and de-duplicating the stops named in its legs.
- * This is a frontend-only stage; adding a dedicated backend endpoint for this
- * was avoided in favour of reusing what Stage 3 already exposes.
- */
 export function useRoutesData(): RoutesData {
   const [routes, setRoutes] = useState<Route[]>([]);
-  const [routeDetails, setRouteDetails] = useState<Map<string, RouteDetail>>(new Map());
+  const [stops, setStops] = useState<Stop[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  const detailCache = useRef<Map<string, RouteDetail>>(new Map());
+  const inflight = useRef<Map<string, Promise<RouteDetail | null>>>(new Map());
 
   useEffect(() => {
     let cancelled = false;
 
     async function load() {
       try {
-        const routeList = await api.listRoutes();
+        const [routeList, stopList] = await Promise.all([api.listRoutes(), api.getStops()]);
         if (cancelled) return;
         setRoutes(routeList);
-
-        const details = await Promise.all(routeList.map((r) => api.getRoute(r.id)));
-        if (cancelled) return;
-
-        const detailMap = new Map<string, RouteDetail>();
-        details.forEach((d, i) => detailMap.set(routeList[i].id, d));
-        setRouteDetails(detailMap);
+        setStops(stopList);
       } catch {
         if (!cancelled) setError("Could not load routes and stops.");
       } finally {
@@ -51,14 +54,29 @@ export function useRoutesData(): RoutesData {
     };
   }, []);
 
-  const stopsById = new Map<string, Stop>();
-  for (const detail of routeDetails.values()) {
-    for (const leg of detail.legs) {
-      stopsById.set(leg.from_stop_id, { id: leg.from_stop_id, name: leg.from_stop_name });
-      stopsById.set(leg.to_stop_id, { id: leg.to_stop_id, name: leg.to_stop_name });
-    }
-  }
-  const stops = Array.from(stopsById.values()).sort((a, b) => a.name.localeCompare(b.name));
+  const getRouteDetail = useCallback(async (routeId: string): Promise<RouteDetail | null> => {
+    const cached = detailCache.current.get(routeId);
+    if (cached) return cached;
 
-  return { routes, stops, routeDetails, loading, error };
+    const pending = inflight.current.get(routeId);
+    if (pending) return pending;
+
+    const promise = api
+      .getRoute(routeId)
+      .then((detail) => {
+        detailCache.current.set(routeId, detail);
+        return detail;
+      })
+      .catch(() => null)
+      .finally(() => {
+        inflight.current.delete(routeId);
+      });
+
+    inflight.current.set(routeId, promise);
+    return promise;
+  }, []);
+
+  const catalogueLoaded = stops.some((s) => s.source === "catalogue");
+
+  return { routes, stops, loading, error, catalogueLoaded, getRouteDetail };
 }

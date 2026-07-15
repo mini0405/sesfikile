@@ -410,3 +410,44 @@ func (r *Repo) GetRouteGeometry(ctx context.Context, routeID uuid.UUID) ([][2]fl
 	}
 	return points, nil
 }
+
+// RouteGeometryRow is one route's stored polyline, paired with its route_id
+// — the shape ListRouteGeometries returns for a bulk read.
+type RouteGeometryRow struct {
+	RouteID uuid.UUID
+	Points  [][2]float64
+}
+
+// ListRouteGeometries returns every stored polyline in one query — the bulk
+// counterpart to GetRouteGeometry. Built for the commuter map's "network
+// coverage" layer: drawing 1447 catalogue polylines via 1447 individual
+// GET /routes/{id}/geometry requests would be a request-count disaster, so
+// the frontend needs exactly one round trip. Only catalogue routes ever have
+// a route_geometries row (CreateRouteGeometry is only ever called by
+// internal/catalogue's importer), so this naturally excludes every
+// hand-seeded corridor without an explicit source filter.
+func (r *Repo) ListRouteGeometries(ctx context.Context) ([]RouteGeometryRow, error) {
+	rows, err := r.pool.Query(ctx, `SELECT route_id, geometry FROM route_geometries ORDER BY route_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []RouteGeometryRow
+	for rows.Next() {
+		var routeID uuid.UUID
+		var data []byte
+		if err := rows.Scan(&routeID, &data); err != nil {
+			return nil, err
+		}
+		var points [][2]float64
+		if err := json.Unmarshal(data, &points); err != nil {
+			return nil, err
+		}
+		result = append(result, RouteGeometryRow{RouteID: routeID, Points: points})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}

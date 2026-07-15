@@ -34,6 +34,7 @@ func NewRouter(pinger Pinger, identityHandlers *identity.Handlers, tokens identi
 
 	r.Get("/routes", routingHandlers.ListRoutes)
 	r.Get("/routes/search", routingHandlers.Search)
+	r.Get("/routes/geometries", routingHandlers.ListRouteGeometries)
 	r.Get("/routes/{id}", routingHandlers.GetRoute)
 	r.Get("/routes/{id}/geometry", routingHandlers.GetRouteGeometry)
 	r.Get("/stops", routingHandlers.ListStops)

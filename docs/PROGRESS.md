@@ -3154,3 +3154,212 @@ go run ./cmd/clearcatalogue -apply   # actually removes it, including route_geom
 ```
 
 Next: Stage 9d — cross-cutting polish, or a frontend follow-up to render catalogue polylines (as directed)
+
+---
+
+## Stage 9b-iii — commuter app: network coverage layer — DONE (2026-07-15)
+
+Extends `apps/commuter` (9b-i map, 9b-ii wallet/pass) with a "network
+coverage" map layer that draws the real 1447-route City of Cape Town
+catalogue as a muted backdrop, plus catalogue-aware badging everywhere a
+route or stop can appear. Frontend-only except for one new minimal backend
+read endpoint (justified below). Core principle held throughout: catalogue
+(browse-only, real geometry, estimated fares, no vehicles) must never be
+visually confusable with live (real vehicles, tested fares) — see CLAUDE.md.
+
+### The one backend addition: `GET /routes/geometries`
+
+The brief allowed exactly one minimal bulk-read endpoint if per-route
+fetches wouldn't scale, and they clearly wouldn't: 1447 routes via
+`GET /routes/{id}/geometry` is 1447 round trips before a single pixel of
+coverage could be drawn. Added:
+- `internal/routing.Repo.ListRouteGeometries` — one query, `SELECT route_id,
+  geometry FROM route_geometries ORDER BY route_id`. Only catalogue routes
+  ever have a `route_geometries` row (only `internal/catalogue`'s importer
+  ever calls `CreateRouteGeometry`), so this naturally excludes every
+  hand-seeded corridor with no source filter needed.
+- `internal/routing.Handlers.ListRouteGeometries` — `GET
+  /routes/geometries[?max_points=N]`, wired into the existing public
+  `/routes*` route group (no auth, consistent with `/routes`/`/stops`).
+  Decimates each polyline server-side to `max_points` (default 40, `0` =
+  no decimation): a simple even-stride selection that always keeps the
+  first/last point (so a rank's real endpoint is never visually clipped),
+  not Douglas-Peucker — sufficient for a muted backdrop that was never meant
+  to be the map's focal content, noted as a future upgrade if closer-zoom
+  fidelity is ever needed. Response: `[{route_id, original_point_count,
+  points}]`.
+- Measured against the real 1447-route catalogue: undecimated the dataset
+  is 1447 routes × ~395 pts ≈ 571k points; decimated to 40/route it's
+  57,680 points, a 1.4MB JSON response, served in ~250ms locally. One
+  request, fetched lazily (only when the coverage toggle is first switched
+  on, not on every app load), cached client-side for the session.
+
+### Performance approach for drawing it: bulk fetch + one multi-polyline + canvas renderer
+
+Rejected per-route `<Polyline>` React elements (1447 separate Leaflet Path
+layers) as the obvious way to blow this up. Instead:
+1. **Bulk fetch** (above) — one request, not 1447.
+2. **Server-side decimation** (above) — 57.7k points instead of 571k.
+3. **One `<Polyline positions={...}>` with a multi-line coordinate array**
+   (`[number,number][][]`) instead of 1447 separate `<Polyline>` elements —
+   Leaflet's `L.polyline` natively supports disjoint multi-line geometry as
+   a single Path/Layer, so this is one Leaflet layer object for the entire
+   network, not 1447 React-managed ones.
+4. **`preferCanvas` on `MapContainer`** — routes all vector layers (this
+   polyline included) through Leaflet's canvas renderer instead of SVG, so
+   drawing/redrawing 57.7k points on pan/zoom is one canvas repaint, not
+   thousands of DOM node updates.
+- **Viewport-bounded rendering was considered and not needed** — the brief
+  asked for the smoothest approach and to justify the choice; measured pan
+  interaction (Playwright-driven drag, see Verified below) stayed under
+  400ms with the full network drawn, so the added complexity of
+  bounds-filtering client-side wasn't justified for this dataset size.
+  Left as a documented future option if the catalogue ever grows
+  materially larger.
+- Coverage lines use Leaflet's default pane z-indices, unmodified —
+  `Polyline` defaults to `overlayPane` (z-index 400), `Marker` to
+  `markerPane` (z-index 600), so a live vehicle marker is *structurally*
+  always drawn above the backdrop, not just by JSX ordering luck (which was
+  also kept correct: markers render after the polyline in source order).
+
+### Frontend changes
+
+`apps/commuter/src/types.ts` — added `RouteSource` (`"seed" | "catalogue"`),
+`Route.source`, `RouteLeg.fare_estimated`, `Stop.latitude/longitude/
+coordinates_known/source`, and `RouteGeometrySummary`. `api/client.ts` —
+added `getStops()` (`GET /stops`) and `getRouteGeometries(maxPoints?)`
+(`GET /routes/geometries`).
+
+**A necessary fix uncovered along the way: `useRoutesData` no longer
+prefetches every route's detail.** The hook previously (9b-i, back when
+there was no `GET /stops`) built its stop list by fetching *every* route's
+detail up front — fine at 8 routes, a ~1447-request stampede once the
+catalogue is loaded, which would have made this stage's own map
+unreachable before a screenshot could even be taken. Rewrote it to: fetch
+`GET /routes` (list only) and `GET /stops` (the endpoint a prior backend
+pass — "Gap 2" in the housekeeping entry above — built for exactly this,
+never previously adopted client-side) in parallel on load, and expose a new
+`getRouteDetail(routeId)` that fetches-and-caches one route's detail lazily,
+only when a screen actually needs it. `RoutesScreen` and `BoardScreen`
+(the only two consumers of a route's ordered legs) now call this on
+selection via a small new `useRouteDetail` hook instead of reading from a
+pre-populated `Map`. `catalogueLoaded` (any stop tagged `source:
+"catalogue"`) is derived from the already-fetched stop list — no extra
+request — and is what every graceful-degradation check below reads.
+
+**`RouteSourceBadge`** (new, `src/components/`) — the one visual marker
+used everywhere a route's identity needs to be shown: a teal "LIVE" pill
+(reusing the app's existing "transit" tone, already the "currently moving"
+color) or a muted dashed-border "COVERAGE" pill. Used in `RoutesScreen`'s
+list and detail, `SearchScreen`'s result header and per-segment rows.
+
+**`MapScreen`** — the main deliverable:
+- The "Watching route" picker now lists only live/seeded routes
+  (`routes.filter(r => r.source !== "catalogue")`) — a catalogue route can
+  never have a vehicle, so listing all 1447 of them there would be both
+  useless and, at that size, a broken dropdown. This is also what keeps the
+  existing three-state gating (pick a route / no vehicles / live) working
+  unchanged when coverage is off — verified byte-for-byte visually
+  identical to pre-stage behaviour (see Verified).
+- New **network coverage toggle**, its own control independent of "watching
+  a route" (coverage shows the whole network; watching shows one route's
+  vehicles). Lazily fetches geometries via `useRouteGeometries` (new hook)
+  only on first switch-on, cached after. **Degrades gracefully when the
+  catalogue isn't loaded**: the checkbox is `disabled` (not hidden, not
+  erroring) with an inline hint — "Not available — this backend has no
+  route catalogue imported" — verified against a genuinely clean 8/12
+  baseline.
+- Coverage ON changes the map's visibility rule: previously the map only
+  rendered when a route was selected and had vehicles; now the map surface
+  itself *is* the coverage layer, so it stays up regardless of
+  route-watching state. If a route happens to be selected with zero
+  vehicles while coverage is on, that's now a small non-blocking overlay
+  chip ("No vehicles online on X right now") instead of the old
+  full-screen empty state, so the backdrop stays visible underneath it.
+- **Legend**, shown only when coverage is on, using the brief's own wording
+  verbatim: a small vehicle-marker swatch + "Live routes — vehicles running
+  now", and a dashed-line swatch + "Network coverage — real City of Cape
+  Town route data, no live vehicles, fares estimated".
+
+**`SearchScreen`** — origin/destination `<select>`s now use `<optgroup>`
+("Live ranks" / "Network coverage (browse only)") built from `Stop.source`,
+so the picker's 561 stops (12 live + 549 catalogue, once loaded) stay
+scannable without hiding either group — the brief's explicit "don't hide
+the catalogue ranks, just label them truthfully." A search result whose
+segment(s) resolve to a catalogue route (checked via `Route.source` looked
+up by `route_id`, never guessed from the name) gets: a "COVERAGE" badge
+next to the transfer/direct heading, "Est. total fare" instead of "Total
+fare" in the total, an explicit browse-only/estimated-fare/no-boarding-pass
+disclaimer paragraph, and a per-segment badge on each route button. A live
+result is visually unchanged (still gets a "LIVE" badge on its segment
+button, confirmed fully functional end-to-end in Verified).
+
+**`BoardScreen`** — the "Route" picker in trip selection now filters to
+`routes.filter(r => r.source !== "catalogue")` (with a one-line caption
+explaining why fewer routes appear here than in the Routes tab). This is a
+small, deliberate extension of the brief's "must not offer generate
+boarding pass / request-a-stop as if rideable" principle: `BoardScreen`'s
+own picker is the *only* path in this app that can issue a real boarding
+pass (`SearchScreen` never offered one directly — only a "view route"
+drill-down into `RoutesScreen`, which is read-only), and the backend's
+`POST /boarding/pass` has no source check of its own (issuing a pass for a
+catalogue route would succeed and produce a token that can structurally
+never be scanned, since no vehicle ever exists on a catalogue route).
+Omitting catalogue routes here entirely — rather than listing them
+disabled with an asterisk — was judged the more honest reading of "never
+visually confusable, never implies ride-able-later" for a picker whose
+entire purpose is starting a real ride.
+
+**`RoutesScreen`** — kept as the browse-everything list (all 1455 routes
+once the catalogue is loaded, unchanged in scope from 9b-i); each row and
+the detail view now carry a `RouteSourceBadge`, and a catalogue route's
+detail view adds the same browse-only/estimated-fare disclaimer paragraph
+used in Search, plus "Estimated full-route fare" instead of "Full-route
+fare". Not restructured into a search/filtered view — out of this stage's
+explicit scope (map, search, stop pickers) — but the badge means a user
+scrolling it is never left guessing which of the 1455 entries are real
+right now.
+
+### Verified
+
+`npx tsc --noEmit` and `npm run build` (apps/commuter) both clean. Backend:
+`go build ./...`, `go vet ./...`, `gofmt -l .`, `go mod tidy` all clean (no
+new dependency — `ListRouteGeometries` reuses `encoding/json` + the existing
+JSONB column), and `go test -race -count=1 ./...` green across every
+package with the catalogue unloaded (baseline untouched).
+
+End-to-end, Playwright-driven (Chromium, same cached-browser approach as
+prior frontend stages) against a live backend:
+- **Catalogue NOT loaded (clean 8/12 baseline)**: map screen identical to
+  pre-stage behaviour; coverage toggle present but disabled with the
+  graceful-degradation hint; no errors.
+- **Catalogue loaded** (1447 routes / 549 catalogue stops via
+  `cmd/importcatalogue`, real GeoJSON): (a) coverage OFF — map screen
+  unchanged from baseline, confirming the live-route-only picker keeps the
+  old three-state behaviour intact even with 1447 extra routes in the
+  system; (b) coverage ON with no route watched — the full network renders
+  as thin muted dashed lines over blank/unloaded tiles (OSM fetch was
+  offline in this sandboxed run — the app's own documented "one online
+  dependency" limitation, not a bug) with the legend correctly captioned;
+  brought a seeded driver online via `cmd/wsdriver` on "Bellville - Cape
+  Town CBD", selected it in the picker — the live teal vehicle marker
+  (seat count visible) renders clearly on top of the coverage backdrop, and
+  a mouse-drag pan (~355ms) redraws both layers smoothly with no visible
+  lag or artifacts; coverage fetch-to-rendered settle time measured at
+  ~560ms for the full 57.7k-point network; (c) `GET /stops` grouped
+  correctly into 12 "Live ranks" / 549 "Network coverage (browse only)"
+  optgroups in both Search pickers; a catalogue search (BELLVILLE →
+  DURBANVILLE) showed the COVERAGE badge, "Est. total fare", the
+  browse-only disclaimer, and a badged segment button; (d) a live search
+  (Cape Town Station → Khayelitsha Town Centre) rendered exactly as before
+  9b-iii, with a LIVE badge on its segment button, fully functional;
+  Board's route picker confirmed to list exactly 8 options (the seeded
+  routes only, verified via option count) with 1447 catalogue routes
+  correctly absent; Routes tab confirmed to badge every one of the 1447
+  catalogue entries and show the browse-only disclaimer + estimated-fare
+  label on a catalogue route's detail view. Zero browser console
+  errors/exceptions across the whole run. Restored the clean 8-route/
+  12-stop/0-geometry baseline afterward via `cmd/clearcatalogue -apply`,
+  confirmed via direct DB query.
+
+Next: Stage 9d — cross-cutting polish.

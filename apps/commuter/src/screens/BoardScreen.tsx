@@ -2,14 +2,15 @@ import { useMemo, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { api, ApiError } from "../api/client";
 import { useCountdown } from "../hooks/useCountdown";
+import { useRouteDetail } from "../hooks/useRouteDetail";
 import { useRouteVehicles } from "../hooks/useRouteVehicles";
 import type { Route, RouteDetail } from "../types";
 
 interface BoardScreenProps {
   routes: Route[];
-  routeDetails: Map<string, RouteDetail>;
   loading: boolean;
   error: string | null;
+  getRouteDetail: (routeId: string) => Promise<RouteDetail | null>;
 }
 
 interface OrderedStop {
@@ -40,7 +41,16 @@ interface IssuedPass {
   toName: string;
 }
 
-export function BoardScreen({ routes, routeDetails, loading, error }: BoardScreenProps) {
+export function BoardScreen({ routes, loading, error, getRouteDetail }: BoardScreenProps) {
+  // Only ever offer live (seeded) routes here — a catalogue route has no
+  // vehicle/driver data connecting it to anything, so a pass issued against
+  // one could never be scanned. Rather than let a commuter generate a pass
+  // that can structurally never be honoured, catalogue routes simply never
+  // appear in this picker (see CLAUDE.md's "never visually confusable" core
+  // principle for this stage — the honest move here is omission, not a
+  // disabled option with an asterisk).
+  const liveRoutes = useMemo(() => routes.filter((r) => r.source !== "catalogue"), [routes]);
+
   const [routeId, setRouteId] = useState("");
   const [fromStopId, setFromStopId] = useState("");
   const [toStopId, setToStopId] = useState("");
@@ -53,12 +63,13 @@ export function BoardScreen({ routes, routeDetails, loading, error }: BoardScree
   const [stopRequestBusy, setStopRequestBusy] = useState(false);
   const [stopRequestResult, setStopRequestResult] = useState<{ available: boolean; message: string } | null>(null);
 
-  const detail = routeId ? routeDetails.get(routeId) : undefined;
+  const { detail } = useRouteDetail(routeId || null, getRouteDetail);
   const stops = useMemo(() => (detail ? orderedStops(detail) : []), [detail]);
   const fromIndex = stops.findIndex((s) => s.id === fromStopId);
 
   const countdown = useCountdown(pass?.expiresAt ?? null);
   const { vehicles } = useRouteVehicles(pass?.routeId ?? null);
+  const { detail: passDetail } = useRouteDetail(pass?.routeId ?? null, getRouteDetail);
 
   function selectRoute(id: string) {
     setRouteId(id);
@@ -137,8 +148,7 @@ export function BoardScreen({ routes, routeDetails, loading, error }: BoardScree
 
   // ---- The boarding-pass / active-trip view, once a pass has been issued ----
   if (pass) {
-    const passStops = routeDetails.get(pass.routeId);
-    const pickupStops = passStops ? orderedStops(passStops) : [];
+    const pickupStops = passDetail ? orderedStops(passDetail) : [];
 
     return (
       <div className="mx-auto max-w-md px-4 pb-24 pt-6">
@@ -303,12 +313,16 @@ export function BoardScreen({ routes, routeDetails, loading, error }: BoardScree
               <option value="" disabled>
                 {loading ? "Loading routes…" : "Select a route…"}
               </option>
-              {routes.map((r) => (
+              {liveRoutes.map((r) => (
                 <option key={r.id} value={r.id}>
                   {r.name}
                 </option>
               ))}
             </select>
+            <p className="mt-1 text-[11px] text-ink/50">
+              Only live routes with real vehicles are listed here — browse-only network coverage routes aren&rsquo;t
+              boardable.
+            </p>
           </div>
 
           <div>

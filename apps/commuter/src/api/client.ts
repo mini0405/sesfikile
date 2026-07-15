@@ -5,7 +5,9 @@ import type {
   RequestStopResponse,
   Route,
   RouteDetail,
+  RouteGeometrySummary,
   RouteSearchResult,
+  Stop,
   TopupResponse,
 } from "../types";
 
@@ -70,6 +72,18 @@ export const api = {
 
   searchRoutes: (from: string, to: string) =>
     request<RouteSearchResult>(`/routes/search?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`),
+
+  getStops: () => request<Stop[]>("/stops"),
+
+  // Bulk polyline read for the "network coverage" map layer — one request
+  // for every catalogue route's (server-decimated) polyline, instead of
+  // 1447 individual GET /routes/{id}/geometry calls. See
+  // backend/internal/routing.Repo.ListRouteGeometries's doc comment.
+  // maxPoints defaults to the backend's own default (40/route) when omitted.
+  getRouteGeometries: (maxPoints?: number) =>
+    request<RouteGeometrySummary[]>(
+      maxPoints === undefined ? "/routes/geometries" : `/routes/geometries?max_points=${maxPoints}`,
+    ),
 
   getBalance: () => request<BalanceResponse>("/wallet/balance"),
 

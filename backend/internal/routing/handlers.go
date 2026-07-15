@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -282,6 +283,75 @@ func (h *Handlers) GetRouteGeometry(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, geometryResponse{RouteID: id.String(), PointCount: len(points), Points: points})
+}
+
+type routeGeometrySummary struct {
+	RouteID            string `json:"route_id"`
+	OriginalPointCount int    `json:"original_point_count"`
+	// Points is decimated (see decimatePoints) for a bulk response — use
+	// GET /routes/{id}/geometry for a route's exact, undecimated polyline.
+	Points [][2]float64 `json:"points"`
+}
+
+// decimatePoints keeps at most max points from pts, always keeping the
+// first and last (an endpoint dropped from a rank's polyline would visibly
+// clip the drawn route short of its actual rank). Simple stride selection,
+// not Douglas-Peucker — sufficient for a muted backdrop layer that isn't the
+// map's focal content; noted as a future upgrade if truer shape fidelity is
+// ever needed at closer zoom.
+func decimatePoints(pts [][2]float64, max int) [][2]float64 {
+	if max < 2 || len(pts) <= max {
+		return pts
+	}
+	out := make([][2]float64, 0, max)
+	last := len(pts) - 1
+	step := float64(last) / float64(max-1)
+	for i := 0; i < max; i++ {
+		idx := int(float64(i) * step)
+		if idx > last {
+			idx = last
+		}
+		out = append(out, pts[idx])
+	}
+	return out
+}
+
+// ListRouteGeometries handles GET /routes/geometries[?max_points=N] — a bulk
+// read of every catalogue route's display polyline in one response, built
+// for the commuter map's "network coverage" layer (see repo.
+// ListRouteGeometries's doc comment for why this exists as one endpoint
+// rather than N per-route requests). Points are decimated server-side to
+// max_points per route (default 40, 0 = no decimation) to keep the payload
+// drawable — 1447 routes averaging ~395 points each is ~577k points
+// undecimated, which both bloats the response and is far more detail than a
+// muted backdrop line needs.
+func (h *Handlers) ListRouteGeometries(w http.ResponseWriter, r *http.Request) {
+	maxPoints := 40
+	if v := r.URL.Query().Get("max_points"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			maxPoints = n
+		}
+	}
+
+	rows, err := h.repo.ListRouteGeometries(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list route geometries")
+		return
+	}
+
+	resp := make([]routeGeometrySummary, 0, len(rows))
+	for _, row := range rows {
+		pts := row.Points
+		if maxPoints > 0 {
+			pts = decimatePoints(pts, maxPoints)
+		}
+		resp = append(resp, routeGeometrySummary{
+			RouteID:            row.RouteID.String(),
+			OriginalPointCount: len(row.Points),
+			Points:             pts,
+		})
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 type segmentResponse struct {

@@ -13,7 +13,7 @@ export function CommuterApp({ auth: _auth }: { auth: AuthState }) {
   const { logout } = useAuth();
   const [tab, setTab] = useState<Tab>("map");
 
-  const { routes, stops, routeDetails, loading, error } = useRoutesData();
+  const { routes, stops, loading, error, catalogueLoaded, getRouteDetail } = useRoutesData();
 
   const [mapRouteId, setMapRouteId] = useState<string | null>(null);
   const [viewedRouteId, setViewedRouteId] = useState<string | null>(null);
@@ -32,24 +32,25 @@ export function CommuterApp({ auth: _auth }: { auth: AuthState }) {
           selectedRouteId={mapRouteId}
           onSelectRoute={setMapRouteId}
           onLogout={logout}
+          catalogueLoaded={catalogueLoaded}
         />
       )}
       {tab === "search" && (
-        <SearchScreen stops={stops} stopsLoading={loading} stopsError={error} onViewRoute={viewRoute} />
+        <SearchScreen stops={stops} routes={routes} stopsLoading={loading} stopsError={error} onViewRoute={viewRoute} />
       )}
       {tab === "routes" && (
         <RoutesScreen
           routes={routes}
-          routeDetails={routeDetails}
           loading={loading}
           error={error}
           selectedRouteId={viewedRouteId}
           onSelectRoute={setViewedRouteId}
+          getRouteDetail={getRouteDetail}
         />
       )}
       {tab === "wallet" && <WalletScreen />}
       {tab === "board" && (
-        <BoardScreen routes={routes} routeDetails={routeDetails} loading={loading} error={error} />
+        <BoardScreen routes={routes} loading={loading} error={error} getRouteDetail={getRouteDetail} />
       )}
 
       <BottomNav active={tab} onChange={setTab} />
