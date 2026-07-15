@@ -3363,3 +3363,52 @@ prior frontend stages) against a live backend:
   confirmed via direct DB query.
 
 Next: Stage 9d — cross-cutting polish.
+
+---
+
+## Hardening follow-up: server-side enforcement for catalogue boarding passes — DONE (2026-07-15)
+
+9b-iii gated catalogue routes out of the commuter app's Board screen
+client-side, but `POST /boarding/pass` itself had no equivalent check —
+every other honesty boundary in this project is enforced server-side
+(fuel anti-bypass, `stops.Handlers.RequestStop`'s catalogue 422), so a
+client-side-only gate here was an inconsistency, not a deliberate scope
+line. Closed it.
+
+`internal/boarding/handlers.go`'s `IssuePass` now captures the route
+`GetRouteByID` already fetches (previously discarded via `_`) and rejects
+with `422` if `route.Source == routing.SourceCatalogue`, **before** loading
+legs or pricing anything — same shape, same status code, same "explicit
+guard, not an incidental consequence" reasoning as
+`stops.Handlers.RequestStop`'s existing catalogue check, which this
+mirrors almost verbatim. Gated on `Source` specifically — not
+`fare_estimated`, not stop coordinates, not route name — for the same
+reason `cmd/clearcatalogue`'s stop-cleanup query had to stop trusting
+`latitude IS NULL` once catalogue stops got real coordinates (see the
+GeoJSON-upgrade entry above): any field other than `Source` is something a
+catalogue route can coincidentally or eventually look "real" on, while
+`Source` is set once at insert (`CreateRoute` vs `CreateCatalogueRoute`)
+and never drifts.
+
+Tests (`internal/boarding/boarding_test.go`):
+- `TestCatalogueRoute_PassRejected` — a route created via
+  `routing.Repo.CreateCatalogueRoute` (no legs seeded at all, since the
+  guard fires before `ListLegsForRoute` is ever called) gets `422` with an
+  error body on `POST /boarding/pass`, using placeholder UUIDs for
+  `from_stop_id`/`to_stop_id` since they're never reached.
+- `TestSeededRoute_PassStillSucceeds` — the control: a normal seeded-route
+  fixture still issues a pass exactly as before, proving the guard doesn't
+  touch the existing path.
+
+Verified: `go build ./...`, `go vet ./...`, `gofmt -l .` all clean (no new
+dependency). `go test -race -count=1 ./...` green across every package,
+including the two new tests and zero regressions in the rest of
+`boarding_test.go` (tamper/expiry/double-scan/insufficient-funds/
+wrong-driver/offline all still pass unchanged). Confirmed the shared dev
+DB is left at the clean 8-route/12-stop baseline afterward (both new
+tests clean up their own fixture rows via `t.Cleanup`).
+
+The commuter app's client-side Board-screen filter (9b-iii) is now backed
+by this server-side check rather than being the only line of defense —
+the UI omission is a UX nicety, the 422 is what actually makes a catalogue
+pass unissuable.

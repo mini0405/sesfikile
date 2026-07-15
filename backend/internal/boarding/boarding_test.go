@@ -344,6 +344,63 @@ func TestHappyPath_IssueScanChargeSeatDecrement(t *testing.T) {
 	}
 }
 
+// TestCatalogueRoute_PassRejected proves IssuePass's source-based guard,
+// mirroring stops.Handlers.RequestStop's identically-shaped catalogue check.
+// A catalogue route has no legs seeded here at all — the guard fires right
+// after loading the route, before ListLegsForRoute is ever called — so
+// from_stop_id/to_stop_id don't need to resolve to anything real for this
+// test to prove the rejection.
+func TestCatalogueRoute_PassRejected(t *testing.T) {
+	env := setup(t)
+	ctx := context.Background()
+	suffix := uniqueSuffix()
+
+	route, err := env.routing.CreateCatalogueRoute(ctx, "Boarding Test Catalogue Route "+suffix, "City of Cape Town open data")
+	if err != nil {
+		t.Fatalf("failed to create catalogue route: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = env.pool.Exec(context.Background(), `DELETE FROM routes WHERE id = $1`, route.ID)
+	})
+
+	commuterUser, err := env.identity.CreateUser(ctx, "+27"+suffix+"9", nil, "x", identity.RoleCommuter)
+	if err != nil {
+		t.Fatalf("failed to create commuter: %v", err)
+	}
+	commuterTok, err := env.tokens.Issue(commuterUser.ID, identity.RoleCommuter)
+	if err != nil {
+		t.Fatalf("failed to issue commuter token: %v", err)
+	}
+
+	status, body := doJSON(t, env.server, http.MethodPost, "/boarding/pass", commuterTok, map[string]string{
+		"route_id":     route.ID.String(),
+		"from_stop_id": uuid.NewString(),
+		"to_stop_id":   uuid.NewString(),
+	})
+	if status != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422 issuing a pass for a catalogue route, got %d: %+v", status, body)
+	}
+	if _, ok := body["error"]; !ok {
+		t.Fatalf("expected an error message in the response, got %+v", body)
+	}
+}
+
+// TestSeededRoute_PassStillSucceeds is the control for the test above — the
+// guard must reject catalogue routes without touching the existing seeded
+// (source='seed') path at all.
+func TestSeededRoute_PassStillSucceeds(t *testing.T) {
+	env := setup(t)
+	fx := seedFixture(t, env, 10000, 1500)
+
+	passToken, fareCents := issuePass(t, env, fx)
+	if passToken == "" {
+		t.Fatalf("expected a non-empty pass token for a seeded route")
+	}
+	if fareCents != 1500 {
+		t.Fatalf("expected fare_cents 1500, got %d", fareCents)
+	}
+}
+
 func TestTamperedPass_Rejected(t *testing.T) {
 	env := setup(t)
 	fx := seedFixture(t, env, 10000, 1500)

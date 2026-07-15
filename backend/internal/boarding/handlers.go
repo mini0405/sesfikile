@@ -98,8 +98,23 @@ func (h *Handlers) IssuePass(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := h.routingRepo.GetRouteByID(r.Context(), routeID); err != nil {
+	route, err := h.routingRepo.GetRouteByID(r.Context(), routeID)
+	if err != nil {
 		writeError(w, http.StatusNotFound, "route not found")
+		return
+	}
+	if route.Source == routing.SourceCatalogue {
+		// Explicit, intentional guard — mirrors stops.Handlers.RequestStop's
+		// same-shaped check. Gated on Source, not on fare_estimated or
+		// coordinates or name: a catalogue route's fields can otherwise look
+		// arbitrarily "real" (real coordinates since the GeoJSON upgrade,
+		// a plausible-looking distance-estimated fare), so Source is the one
+		// field that can never be spoofed into looking live. No vehicle can
+		// ever go online on a catalogue route, so a pass issued against one
+		// could never be scanned — reject at issue time rather than letting
+		// a commuter hold a token that's meaningless by construction.
+		writeError(w, http.StatusUnprocessableEntity,
+			"this is a catalogue-imported route with no live vehicles — boarding passes aren't available on it")
 		return
 	}
 	legs, err := h.routingRepo.ListLegsForRoute(r.Context(), routeID)
