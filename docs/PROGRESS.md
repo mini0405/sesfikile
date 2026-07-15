@@ -3412,3 +3412,104 @@ The commuter app's client-side Board-screen filter (9b-iii) is now backed
 by this server-side check rather than being the only line of defense —
 the UI omission is a UX nicety, the 422 is what actually makes a catalogue
 pass unissuable.
+
+---
+
+## Dev tooling — one-command stack-up + manual test checklist (2026-07-15)
+
+Developer-experience pass, no feature or app-code changes: replaces manually
+juggling ~5 terminals (`docker compose up`, `cmd/seed`, `cmd/server`, and
+`npm run dev` in each of `apps/driver`, `apps/commuter`, `apps/owner`) with
+one command, plus a manual click-through test script for verifying the whole
+system by hand.
+
+Built:
+- `scripts/dev-up.ps1` — starts Postgres via `infra/docker-compose.yml` and
+  polls `docker inspect --format='{{.State.Health.Status}}'` until healthy
+  (no blind sleep); checks port 5432 isn't already held by a non-Docker
+  process first (the native-Windows-Postgres-shadowing quirk this machine
+  has, documented in CLAUDE.md) and fails fast with a clear message naming
+  the offending process if so. Runs `cmd/seed` (migrations apply
+  automatically on its own startup, per Stage 1), optionally `cmd/importcatalogue`
+  behind `-WithCatalogue` (warns and continues, doesn't fail, if
+  `backend/data/taxi_routes.json` is missing — it's gitignored/opt-in), and
+  `-SkipSeed` to skip seeding on a repeat run. Checks each app's
+  `node_modules` exists before launching anything, failing with the exact
+  `npm install` commands needed otherwise. Launches the backend and all
+  three Vite dev servers each in their own PowerShell window (readable logs,
+  independently Ctrl+C-able), then polls `/health` and each app's root URL
+  before printing a final summary of all four URLs.
+- `scripts/dev-down.ps1` — stops the backend/driver/commuter/owner dev
+  servers by finding whatever process owns ports 8080/5174/5175/5176 (not
+  tracked PIDs — robust even if a window was closed by hand), then
+  `docker compose down`. `-WipeDb` additionally runs `docker compose down -v`
+  (destroys the Postgres volume) but requires a typed `yes` confirmation
+  unless `-Force` is also passed — called out loudly in the script's output
+  either way.
+- `docs/TESTING.md` — a step-by-step manual click-through script for a
+  non-developer tester, covering: prerequisites + the one-command start; the
+  real seeded logins (pulled from `cmd/seed`'s own printed output); the full
+  core loop end to end (driver online with a real geolocation permission
+  prompt → commuter sees the live vehicle marker → wallet balance → generate
+  a boarding pass, including the QR code's "show raw token" fallback for a
+  camera-less laptop → driver's manual-paste scan path → fare-split receipt
+  → commuter's wallet debited by exactly the fare → owner's revenue/ledger
+  tabs show the trip); the idempotency demo (same token scanned twice →
+  "Already Paid", no double charge, seats unchanged); request-a-stop
+  (commuter requests → driver's Alerts screen → "Acknowledge"); the optional
+  `-WithCatalogue` coverage layer (toggle, "Coverage" badge, no boarding
+  option on a catalogue search result); a KNOWN LIMITATIONS section (camera/
+  geolocation need a secure context — manual paste is the real dev path over
+  LAN http; catalogue is browse-only; fuel/VIU is mocked); and a short
+  troubleshooting table. UI label strings (button text, screen names) were
+  taken from the actual frontend source, not guessed.
+- Root `README.md` — was a thin stub; now points at `scripts/dev-up.ps1` and
+  `docs/TESTING.md` as the way to run and verify the system, alongside the
+  existing MVP-scope/stack summary.
+
+Decisions / deviations:
+- **`$ErrorActionPreference = "Continue"`, not `"Stop"`, in both scripts,
+  with every native-command result checked explicitly via `$LASTEXITCODE`.**
+  Discovered while first running this by hand: Windows PowerShell 5.1 wraps
+  a native command's stderr output (which `docker compose` writes routinely,
+  even on success — e.g. "Container ... Running") in a `NativeCommandError`
+  and sets `$?` to `$false`, which under `"Stop"` aborts the whole script on
+  a successful `docker compose up -d`. Checking `$LASTEXITCODE` (the actual
+  process exit code) instead of `$?`/relying on `"Stop"` sidesteps this
+  entirely — a Windows-PowerShell-specific gotcha, not a bug in Docker or in
+  the original design.
+- **Dev-server processes are stopped by port ownership, not by a tracked-PID
+  file.** Simpler and more robust: works even if the user closed one of the
+  four windows by hand or restarted a single service mid-session, with no
+  stale-PID-file cleanup logic needed.
+- **All non-ASCII punctuation (em dashes) was kept out of both `.ps1`
+  files.** A first draft used em dashes in comments/strings and hit a
+  PowerShell parser error (`Unexpected token '}'`, string terminator
+  confusion) — traced to Windows PowerShell 5.1 reading a BOM-less UTF-8
+  script file under the system codepage, corrupting the multi-byte
+  characters and cascading into a parse failure well past the actual
+  characters. Plain ASCII hyphens sidestep the encoding question entirely
+  rather than fixing it (e.g. forcing a UTF-8-BOM save), which is more
+  robust across whatever editor/tool last touched the file.
+- `dev-up.ps1`'s Postgres-port-shadow check treats `wslrelay`/`wsl`-named
+  owners of port 5432 as legitimate (Docker Desktop's WSL2 backend
+  genuinely holds that port during normal operation) — the check is
+  specifically for a *different*, non-Docker Postgres service, not for
+  Docker's own plumbing. First run on this machine false-positived on
+  `wslrelay` before this was added.
+
+Verified: ran `scripts/dev-up.ps1` for real end-to-end on this machine —
+Postgres came up and reported healthy via polling, `cmd/seed` ran and
+printed the full seeded-logins/routes table, all three `node_modules`
+checks passed, and all four services (backend `/health` → `{"status":"ok","db":"ok"}`,
+and `http://localhost:5174/5175/5176`) came up and responded 200. Ran
+`scripts/dev-down.ps1` immediately after: all four ports (8080/5174/5175/5176)
+confirmed free and the Postgres container confirmed removed
+(`docker ps -a` showed no `sesfikile-postgres`) afterward. No app code was
+touched by this pass: `go build ./...`, `go vet ./...`, `gofmt -l .`, and
+`go test -race -count=1 ./...` all still pass clean across every backend
+package (brought Postgres back up standalone via `docker compose up -d` to
+run the suite, then back down), and `npx tsc --noEmit` passes clean in all
+three of `apps/driver`, `apps/commuter`, `apps/owner`.
+
+Next: Stage 9d — cross-cutting polish, or further frontend work, as directed.
