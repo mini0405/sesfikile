@@ -73,6 +73,12 @@ export const api = {
       body: JSON.stringify({ pass_token: passToken }),
     }),
 
+  scanBoardingCode: (shortCode: string) =>
+    request<ScanPassResponse>("/boarding/scan", {
+      method: "POST",
+      body: JSON.stringify({ short_code: shortCode }),
+    }),
+
   updateSeats: (body: { delta?: number; seats_available?: number }) =>
     request<SeatsResponse>("/telemetry/seats", {
       method: "POST",

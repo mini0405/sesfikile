@@ -9,7 +9,9 @@ type Mode = "idle" | "camera" | "manual" | "result";
 
 export function ScanScreen() {
   const [mode, setMode] = useState<Mode>("idle");
+  const [manualCode, setManualCode] = useState("");
   const [manualToken, setManualToken] = useState("");
+  const [showTokenFallback, setShowTokenFallback] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ScanPassResponse | null>(null);
@@ -29,7 +31,7 @@ export function ScanScreen() {
         (decodedText) => {
           if (cancelled) return;
           cancelled = true;
-          void handleScan(decodedText);
+          void handleDecoded(decodedText);
         },
         () => {
           // per-frame "no QR found" callback — expected on most frames, ignore
@@ -59,12 +61,42 @@ export function ScanScreen() {
     }
   }
 
-  async function handleScan(token: string) {
+  // The QR now encodes only the short code (Stage 5 upgrade: airport-style
+  // boarding codes) — a raw signed pass_token contains a "." separating its
+  // payload/signature segments, which an 8-character Crockford-base32 code
+  // never does, so this dispatches on shape rather than needing two camera
+  // modes. Kept for dev/back-compat: a pasted or scanned full token still works.
+  async function handleDecoded(text: string) {
+    const trimmed = text.trim();
+    if (trimmed.includes(".")) {
+      await chargeByToken(trimmed);
+    } else {
+      await chargeByCode(trimmed);
+    }
+  }
+
+  async function chargeByCode(code: string) {
     await stopCamera();
     setBusy(true);
     setError(null);
     try {
-      const res = await api.scanBoardingPass(token.trim());
+      const res = await api.scanBoardingCode(code);
+      setResult(res);
+      setMode("result");
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Scan failed. Try again.");
+      setMode("idle");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function chargeByToken(token: string) {
+    await stopCamera();
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await api.scanBoardingPass(token);
       setResult(res);
       setMode("result");
     } catch (err) {
@@ -78,7 +110,9 @@ export function ScanScreen() {
   function reset() {
     setResult(null);
     setError(null);
+    setManualCode("");
     setManualToken("");
+    setShowTokenFallback(false);
     setMode("idle");
   }
 
@@ -104,7 +138,7 @@ export function ScanScreen() {
             📷 Open camera
           </button>
           <button onClick={() => setMode("manual")} className="btn-ghost">
-            Paste pass token instead
+            Enter boarding code instead
           </button>
         </div>
       )}
@@ -127,27 +161,68 @@ export function ScanScreen() {
       )}
 
       {mode === "manual" && (
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            void handleScan(manualToken);
-          }}
-          className="space-y-3"
-        >
-          <textarea
-            value={manualToken}
-            onChange={(e) => setManualToken(e.target.value)}
-            placeholder="Paste the pass_token string here"
-            rows={4}
-            className="w-full rounded-sm border-2 border-tar-600 bg-tar-800 px-3 py-2.5 font-mono text-xs text-board outline-none focus:border-rank"
-          />
-          <button type="submit" disabled={busy || manualToken.trim().length === 0} className="btn-rank">
-            {busy ? "Charging…" : "Charge fare"}
-          </button>
-          <button type="button" onClick={() => setMode("idle")} className="btn-ghost">
-            Cancel
-          </button>
-        </form>
+        <div className="space-y-4">
+          {/* The primary fallback when the camera is unavailable — e.g. no
+              secure-context camera permission over plain http on a LAN phone
+              demo. Big, uppercase, code-friendly: matches the commuter app's
+              grouped K7M2-9XQP display, case-insensitive and hyphen-tolerant
+              on submit (the backend normalizes it too, but doing it here
+              keeps what the driver sees honest about what will be sent). */}
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              void chargeByCode(manualCode);
+            }}
+            className="space-y-3"
+          >
+            <label className="block text-xs font-bold uppercase tracking-wide text-tar-400">Boarding code</label>
+            <input
+              type="text"
+              inputMode="text"
+              autoCapitalize="characters"
+              autoCorrect="off"
+              spellCheck={false}
+              value={manualCode}
+              onChange={(e) => setManualCode(e.target.value.toUpperCase())}
+              placeholder="K7M2-9XQP"
+              className="w-full rounded-sm border-2 border-tar-600 bg-tar-800 px-3 py-4 text-center font-display text-3xl font-black uppercase tracking-[0.15em] text-board outline-none focus:border-rank"
+            />
+            <button type="submit" disabled={busy || manualCode.trim().length === 0} className="btn-rank">
+              {busy ? "Charging…" : "Charge fare"}
+            </button>
+            <button type="button" onClick={() => setMode("idle")} className="btn-ghost">
+              Cancel
+            </button>
+          </form>
+
+          <details
+            className="text-left"
+            open={showTokenFallback}
+            onToggle={(e) => setShowTokenFallback(e.currentTarget.open)}
+          >
+            <summary className="cursor-pointer text-xs font-bold uppercase tracking-wide text-tar-400">
+              Dev fallback: paste full pass token
+            </summary>
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                void chargeByToken(manualToken);
+              }}
+              className="mt-2 space-y-3"
+            >
+              <textarea
+                value={manualToken}
+                onChange={(e) => setManualToken(e.target.value)}
+                placeholder="Paste the pass_token string here"
+                rows={4}
+                className="w-full rounded-sm border-2 border-tar-600 bg-tar-800 px-3 py-2.5 font-mono text-xs text-board outline-none focus:border-rank"
+              />
+              <button type="submit" disabled={busy || manualToken.trim().length === 0} className="btn-ghost">
+                {busy ? "Charging…" : "Charge with raw token"}
+              </button>
+            </form>
+          </details>
+        </div>
       )}
 
       {mode === "result" && result && (

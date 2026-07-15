@@ -33,12 +33,20 @@ function orderedStops(detail: RouteDetail): OrderedStop[] {
 
 interface IssuedPass {
   token: string;
+  shortCode: string;
   expiresAt: string;
   fareCents: number;
   routeId: string;
   routeName: string;
   fromName: string;
   toName: string;
+}
+
+/** "K7M29XQP" -> "K7M2-9XQP" — the display grouping the brief asks for, easier
+ * to read aloud or copy by eye than one unbroken 8-char run. Purely cosmetic:
+ * the backend's NormalizeCode strips the hyphen back out on lookup. */
+function formatCodeForDisplay(code: string): string {
+  return code.length === 8 ? `${code.slice(0, 4)}-${code.slice(4)}` : code;
 }
 
 export function BoardScreen({ routes, loading, error, getRouteDetail }: BoardScreenProps) {
@@ -58,6 +66,7 @@ export function BoardScreen({ routes, loading, error, getRouteDetail }: BoardScr
   const [issueError, setIssueError] = useState<string | null>(null);
   const [pass, setPass] = useState<IssuedPass | null>(null);
   const [copied, setCopied] = useState(false);
+  const [codeCopied, setCodeCopied] = useState(false);
 
   const [stopRequestStopId, setStopRequestStopId] = useState("");
   const [stopRequestBusy, setStopRequestBusy] = useState(false);
@@ -93,6 +102,7 @@ export function BoardScreen({ routes, loading, error, getRouteDetail }: BoardScr
       const toStop = stops.find((s) => s.id === toStopId);
       setPass({
         token: res.pass_token,
+        shortCode: res.short_code,
         expiresAt: res.expires_at,
         fareCents: res.fare_cents,
         routeId,
@@ -121,6 +131,17 @@ export function BoardScreen({ routes, loading, error, getRouteDetail }: BoardScr
       setTimeout(() => setCopied(false), 1500);
     } catch {
       // clipboard API unavailable — the raw token is already selectable text
+    }
+  }
+
+  async function copyCode() {
+    if (!pass) return;
+    try {
+      await navigator.clipboard.writeText(pass.shortCode);
+      setCodeCopied(true);
+      setTimeout(() => setCodeCopied(false), 1500);
+    } catch {
+      // clipboard API unavailable — the code is already selectable text
     }
   }
 
@@ -180,8 +201,21 @@ export function BoardScreen({ routes, loading, error, getRouteDetail }: BoardScr
             </div>
           ) : (
             <>
-              <div className="mx-auto mb-4 inline-block rounded-sm border-2 border-ink bg-white p-3 shadow-tape">
-                <QRCodeSVG value={pass.token} size={220} bgColor="#ffffff" fgColor="#201C16" level="M" />
+              {/* The short code is the hero: large, monospace, grouped for
+                  reading aloud or typing — the primary artifact, alongside a
+                  now-chunky QR that encodes only this 8-character code
+                  (version 1, instantly scannable) instead of the ~450-char
+                  signed token. */}
+              <p className="mb-1 text-xs font-bold uppercase tracking-wide text-ink/50">Boarding code</p>
+              <p className="mb-3 select-all font-display text-4xl font-black tracking-[0.08em] tabular-nums text-ink sm:text-5xl">
+                {formatCodeForDisplay(pass.shortCode)}
+              </p>
+              <button onClick={() => void copyCode()} className="btn-ghost mb-4">
+                {codeCopied ? "Copied!" : "Copy code"}
+              </button>
+
+              <div className="mx-auto mb-4 inline-block rounded-sm border-2 border-ink bg-white p-4 shadow-tape">
+                <QRCodeSVG value={pass.shortCode} size={160} bgColor="#ffffff" fgColor="#201C16" level="M" />
               </div>
 
               <p className="font-display text-3xl font-black tabular-nums text-ink">{countdown.label}</p>
@@ -201,7 +235,7 @@ export function BoardScreen({ routes, loading, error, getRouteDetail }: BoardScr
 
               <details className="text-left">
                 <summary className="cursor-pointer text-xs font-bold uppercase tracking-wide text-ink/50">
-                  No camera? Show raw token
+                  Dev fallback: show raw signed token
                 </summary>
                 <div className="mt-2 space-y-2">
                   <p className="break-all rounded-sm border border-dashed border-ink/30 bg-board-dim px-2 py-2 font-mono text-[10px] text-ink/70">

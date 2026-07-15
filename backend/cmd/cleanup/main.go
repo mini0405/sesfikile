@@ -1,7 +1,12 @@
 // Command cleanup removes leftover test-generated routes/stops from the
 // persistent dev Postgres — rows created by DB-backed integration tests
 // (internal/{boarding,stops,telemetry}) that run against the shared dev
-// database rather than a disposable one. It is SAFE and IDEMPOTENT:
+// database rather than a disposable one — and also sweeps long-expired
+// boarding_pass_codes rows (short boarding codes, see internal/boarding/
+// passstore.go). The latter already happens opportunistically on every
+// code-based scan (PassStore.Lookup), so this is only needed to reclaim
+// codes that were issued but never scanned again — the common case. It is
+// SAFE and IDEMPOTENT:
 //
 //   - It only ever matches routes/stops whose names match the exact,
 //     hand-verified junk-name patterns below (see docs/PROGRESS.md's
@@ -33,6 +38,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"sesfikile/backend/internal/boarding"
 	"sesfikile/backend/internal/config"
 )
 
@@ -83,6 +89,31 @@ func main() {
 	}
 }
 
+// sweepExpiredBoardingCodes reports (dry run) or deletes (apply) long-expired
+// boarding_pass_codes rows — see PassStore's sweepGrace doc comment for why a
+// grace period beyond the pass TTL is used rather than deleting the instant a
+// code expires (it would otherwise race a driver's scan and turn an
+// informative "pass has expired" 410 into an indistinguishable "unknown
+// code" 401).
+func sweepExpiredBoardingCodes(ctx context.Context, pool *pgxpool.Pool, apply bool) error {
+	if !apply {
+		var count int
+		if err := pool.QueryRow(ctx, boarding.ExpiredCodesCountQuery, boarding.SweepCutoff()).Scan(&count); err != nil {
+			return err
+		}
+		fmt.Printf("Boarding codes: %d expired row(s) would be swept (older than the %s grace period).\n", count, boarding.SweepGrace)
+		return nil
+	}
+
+	passStore := boarding.NewPassStore(pool)
+	deleted, err := passStore.CleanupExpired(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Boarding codes: deleted %d expired row(s).\n", deleted)
+	return nil
+}
+
 type matchedRoute struct {
 	ID   uuid.UUID
 	Name string
@@ -94,6 +125,10 @@ type matchedStop struct {
 }
 
 func run(ctx context.Context, pool *pgxpool.Pool, apply bool) error {
+	if err := sweepExpiredBoardingCodes(ctx, pool, apply); err != nil {
+		return fmt.Errorf("failed to sweep expired boarding codes: %w", err)
+	}
+
 	routes, err := findMatchedRoutes(ctx, pool)
 	if err != nil {
 		return fmt.Errorf("failed to query matched routes: %w", err)
@@ -128,6 +163,17 @@ func run(ctx context.Context, pool *pgxpool.Pool, apply bool) error {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
+
+	// boarding_pass_codes.route_id FKs to routes(id) (short boarding codes,
+	// see internal/boarding/passstore.go) — a matched junk route can have
+	// leftover code rows from short-lived test passes, which would otherwise
+	// block the route delete below with a foreign-key violation. These are
+	// always long-expired by the time cleanup runs (junk routes only come
+	// from finished test runs), so deleting them here is safe regardless of
+	// PassStore's own sweepGrace window.
+	if _, err := tx.Exec(ctx, `DELETE FROM boarding_pass_codes WHERE route_id = ANY($1)`, routeIDs); err != nil {
+		return fmt.Errorf("failed to delete boarding_pass_codes: %w", err)
+	}
 
 	legsTag, err := tx.Exec(ctx, `DELETE FROM route_legs WHERE route_id = ANY($1)`, routeIDs)
 	if err != nil {

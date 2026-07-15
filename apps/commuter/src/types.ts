@@ -124,6 +124,7 @@ export interface TopupResponse {
 
 export interface IssuePassResponse {
   pass_token: string;
+  short_code: string;
   expires_at: string;
   fare_cents: number;
 }

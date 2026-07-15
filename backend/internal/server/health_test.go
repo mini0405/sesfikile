@@ -41,7 +41,7 @@ func testRouter(pinger Pinger) chi.Router {
 	telemetryHub := telemetry.NewHub()
 	driverAlerts := telemetry.NewDriverAlertHub()
 	telemetryHandlers := telemetry.NewHandlers(telemetryStore, telemetryHub, driverAlerts, identityRepo, routingRepo, tokens)
-	boardingHandlers := boarding.NewHandlers(routingRepo, wallet.NewRepo(nil), identityRepo, telemetryStore, telemetryHub, boarding.NewSigner("test-boarding-secret"), 3*time.Minute, config.FareSplit{PlatformPct: 10, DriverPct: 25, OwnerPct: 65})
+	boardingHandlers := boarding.NewHandlers(routingRepo, wallet.NewRepo(nil), identityRepo, telemetryStore, telemetryHub, boarding.NewSigner("test-boarding-secret"), 3*time.Minute, config.FareSplit{PlatformPct: 10, DriverPct: 25, OwnerPct: 65}, boarding.NewPassStore(nil))
 	stopsHandlers := stops.NewHandlers(stops.NewStore(), routingRepo, telemetryStore, driverAlerts, identityRepo)
 	fuelRepo := fuel.NewRepo(nil, wallet.NewRepo(nil))
 	fuelHandlers := fuel.NewHandlers(fuelRepo, 30, 2200)

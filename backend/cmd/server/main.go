@@ -62,7 +62,8 @@ func main() {
 	telemetryHandlers := telemetry.NewHandlers(telemetryStore, telemetryHub, driverAlerts, identityRepo, routingRepo, tokens)
 
 	boardingSigner := boarding.NewSigner(cfg.BoardingHMACSecret)
-	boardingHandlers := boarding.NewHandlers(routingRepo, walletRepo, identityRepo, telemetryStore, telemetryHub, boardingSigner, cfg.BoardingPassTTL, cfg.FareSplit)
+	boardingPassStore := boarding.NewPassStore(database.Pool)
+	boardingHandlers := boarding.NewHandlers(routingRepo, walletRepo, identityRepo, telemetryStore, telemetryHub, boardingSigner, cfg.BoardingPassTTL, cfg.FareSplit, boardingPassStore)
 
 	stopsStore := stops.NewStore()
 	stopsHandlers := stops.NewHandlers(stopsStore, routingRepo, telemetryStore, driverAlerts, identityRepo)

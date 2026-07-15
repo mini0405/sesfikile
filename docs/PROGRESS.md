@@ -3513,3 +3513,214 @@ run the suite, then back down), and `npx tsc --noEmit` passes clean in all
 three of `apps/driver`, `apps/commuter`, `apps/owner`.
 
 Next: Stage 9d — cross-cutting polish, or further frontend work, as directed.
+
+---
+
+## Short boarding codes (airline-style) — DONE (2026-07-15)
+
+**Problem**: the Stage 5 HMAC pass_token is ~450 characters, forcing a dense
+QR (version ~16-20) that scans unreliably off a phone screen with a driver's
+camera. It's also untypeable, so there was no dignified fallback when the
+camera is unavailable — notably on a phone over LAN `http://`, where the
+browser's secure-context requirement (Stage 9a's known gap) blocks camera
+access entirely, not just degrades it.
+
+**Design — a HANDLE to the existing signed token, not a replacement.** This
+does not touch or weaken the Stage 5 HMAC scheme in any way: the signed
+`pass_token` remains the sole canonical, cryptographically-verified artifact.
+An 8-character code is added purely as a *reference* to an already-issued
+token — the same relationship an airline PNR has to the underlying ticket
+record.
+
+- `POST /boarding/pass` (unchanged inputs) now additionally returns
+  `short_code` alongside `pass_token`/`expires_at`/`fare_cents`. The issued
+  pass is stored server-side keyed by the code.
+- **Code format**: 8 characters of Crockford base32 (`0-9`, `A-Z` minus `I L
+  O U` — already visually-confusable-free, no extra exclusion list needed).
+  32^8 ≈ 1.1 trillion combinations. `backend/internal/boarding/code.go`:
+  `GenerateCode` sources randomness from `crypto/rand` (not `math/rand` —
+  this is a security-relevant identifier); `NormalizeCode` strips
+  hyphens/whitespace and uppercases, so lookup is case-insensitive and
+  tolerant of the display grouping (`K7M2-9XQP`).
+- `POST /boarding/scan` now accepts **either** `pass_token` (byte-for-byte
+  the Stage 5 path, completely untouched) **or** `short_code`. When given a
+  code, `Handlers.ScanPass` resolves it via `PassStore.Lookup` to the stored
+  `pass_token`, then feeds that token into the **exact same** verification
+  sequence used for a directly-submitted token — signature verify, expiry
+  check, driver online/assigned/route match, `ChargeFare` keyed on the
+  pass's nonce, seat decrement gated on `replayed`. There is no second/forked
+  verification path anywhere in the code — see `handlers.go`'s updated
+  `ScanPass` doc comment for the exact sequence.
+
+**Storage: a new Postgres table (`boarding_pass_codes`), not in-memory.**
+Deliberately not modeled after Stage 4/6's in-memory `VehicleStateStore`/
+stop-request `Store`: a boarding pass, though short-lived (~3 min TTL), is a
+financial artifact — worth surviving a server restart mid-demo without
+silently invalidating a code a commuter is currently holding up to a
+driver's camera, and worth being auditable afterward (code, token, nonce,
+commuter_id, route_id, expires_at, created_at — migration
+`000007_boarding_pass_codes`). `PassStore` (`internal/boarding/passstore.go`)
+wraps `INSERT`/lookup/sweep against it.
+
+- **Expiry**: a code inherits the underlying pass's own TTL — `Lookup` does
+  **not** itself check expiry; it hands the resolved token to the same
+  `Signer.Verify` + `PassPayload.Expired` path a direct token uses, so an
+  expired-but-known code fails with the identical 410 a stale token gets.
+  Verified explicitly: `TestExpiredPass_Rejected` now also scans the same
+  expired pass's short code and asserts the same 410.
+- **Idempotency preserved end-to-end**: a code resolves to the same stored
+  nonce every time, so a second scan of the same code hits `ChargeFare`'s
+  existing `idempotency_key` dedupe exactly like a repeated token scan —
+  same transaction, `replayed:true`, no double charge, no double seat
+  decrement. `TestShortCode_Idempotent_SameCodeTwice` proves this
+  explicitly; verified live too (see below).
+- **Cleanup**: two layers, both simple. (1) *Sweep-on-read* —
+  `PassStore.Lookup` opportunistically deletes rows expired more than
+  `sweepGrace` (10 minutes) ago on every call, before doing its own lookup.
+  The 10-minute grace *beyond* the ~3-minute TTL is the important bit: it
+  guarantees a driver who scans a code shortly after it expired still gets
+  the informative "pass has expired" (410) response, rather than the row
+  having already vanished and reading as an indistinguishable "unknown
+  code" (401) — sweeping wouldn't be safe to do at TTL+0 without breaking
+  that guarantee. (2) `cmd/cleanup` (already existing, previously
+  route/stop-junk-only) now also sweeps/reports `boarding_pass_codes` past
+  that same grace window — dry-run by default, same as its existing
+  behavior — for reclaiming codes that were issued but never scanned again
+  (the common case, since `Lookup`'s sweep only fires on an actual
+  code-based scan). Extending `cmd/cleanup` also turned up a real ordering
+  bug it would otherwise have hit in the field: `boarding_pass_codes.route_id`
+  FKs to `routes(id)`, so a junk test route with a leftover (long-expired)
+  code row would fail `cmd/cleanup -apply`'s route delete with a foreign-key
+  violation; fixed by deleting matched routes' `boarding_pass_codes` rows in
+  the same transaction, before `route_legs`/`routes` — caught by actually
+  running `-apply` against the dev DB during this stage's own verification,
+  not discovered later.
+- **Security / rate limiting reasoning**: an 8-character code is short
+  enough that unlimited guessing would matter on its own, so three
+  independent factors combine to make brute-forcing a *live* code
+  infeasible in practice, not just "large enough": (1) the ~3-minute pass
+  TTL bounds the attack window per code; (2) the 1.1e12 code space bounds
+  how many guesses land per attempt; (3) `internal/boarding/ratelimit.go`'s
+  `codeRateLimiter` — a simple in-memory fixed-window counter (10
+  attempts/minute per **driver id**, not per-code) — bounds how many
+  distinct codes one authenticated driver account can even try inside that
+  window. In-memory is sufficient here (single process, no horizontal
+  scaling in this MVP, and the meaningful attacker budget is bounded per
+  authenticated account, not per anonymous IP). Exceeding the limit returns
+  429 before any code lookup runs. `TestShortCode_RateLimited` and
+  `ratelimit_test.go`'s pure unit tests cover this.
+- **No information leak**: an unknown code and a long-since-swept code both
+  return the exact same 401 `"invalid or tampered pass"` a tampered token
+  gets (`TestUnknownCode_Rejected`) — there is no distinct "no such code"
+  message anywhere, so probing can't distinguish "wrong" from "never
+  existed."
+- **Every existing guard still applies unchanged on the code path** — the
+  catalogue-route 422 (there's no separate code-issuing path to bypass it
+  through: `IssuePass` mints both the token and the code together, after
+  the same catalogue check), driver-online/assigned/route-match 409,
+  insufficient-funds 402, wrong-driver 409, offline-driver 409. None of
+  these needed touching; the code path only ever substitutes in for
+  `req.PassToken` before the existing sequence runs.
+
+**Frontend**:
+- `apps/commuter`'s `BoardScreen.tsx`: the short code is now the hero —
+  large monospace, grouped for display (`K7M2-9XQP` via
+  `formatCodeForDisplay`), with a one-tap copy button, sitting above the
+  now-chunky QR (down from encoding the ~450-char token to encoding only the
+  8-character code — QR version 1 instead of ~16-20). The live countdown is
+  unchanged. The raw signed token is still available, demoted into a `<details>`
+  now explicitly labelled "Dev fallback: show raw signed token" rather than
+  the primary disclosure it was before.
+- `apps/driver`'s `ScanScreen.tsx`: manual mode's primary control is now a
+  large, uppercase, hyphen-tolerant "Boarding code" text input (submits via
+  the new `api.scanBoardingCode`) — the intended fallback when the camera's
+  secure-context permission is unavailable. A pasted full token still works
+  too, demoted into its own `<details>` ("Dev fallback: paste full pass
+  token"). The camera path (`handleDecoded`) dispatches on shape — a raw
+  token contains a `.` separating its payload/signature segments, which an
+  8-character Crockford-base32 code never does — so scanning either a code
+  QR or (dev-only) a raw-token QR both work through one camera mode, no UI
+  toggle needed.
+
+**Tradeoff, stated explicitly per the design brief**: the pass is no longer
+statelessly verifiable — resolving a short code requires a server round
+-trip to `PassStore.Lookup`, unlike the original Stage 5 token, which any
+correctly-configured server holding the HMAC secret can verify offline with
+zero DB access. This matters against a **future offline-scan-caching plan**
+(a driver's phone queuing scans while briefly disconnected, then replaying
+them once back online): a cached *token*-only scan could still be verified
+and even provisionally accepted offline (signature + expiry are pure
+functions of the secret + payload), but a cached *code*-only scan cannot be
+resolved to anything without reaching the server first. Any future offline
+flow needs to either keep offline scanning token-based specifically, or
+have the client cache the resolved token alongside the code at scan time
+(before going offline) rather than relying on the code to still resolve
+later. Flagging this now rather than glossing over it.
+
+Built:
+- `backend/migrations/000007_boarding_pass_codes.{up,down}.sql` —
+  `boarding_pass_codes` table + an index on `expires_at` (sweep queries).
+- `backend/internal/boarding/code.go` — `GenerateCode`/`NormalizeCode`.
+- `backend/internal/boarding/passstore.go` — `PassStore` (`Store`, `Lookup`,
+  `CleanupExpired`, `IsUniqueViolation`, exported `SweepGrace`/`SweepCutoff`/
+  `ExpiredCodesCountQuery` for `cmd/cleanup`'s dry-run report).
+- `backend/internal/boarding/ratelimit.go` — `codeRateLimiter` (10/min/driver).
+- `backend/internal/boarding/handlers.go` — `IssuePass` mints+stores a code
+  alongside the token (retrying up to 5 times on the astronomically rare
+  code collision); `ScanPass` accepts `short_code` as an alternative to
+  `pass_token`, rate-limited and resolved before the unchanged verification
+  sequence.
+- `backend/cmd/cleanup/main.go` — sweeps/reports long-expired
+  `boarding_pass_codes` (and now deletes them ahead of matched junk routes
+  to avoid the FK violation described above).
+- `backend/cmd/server/main.go` — wires `boarding.NewPassStore(database.Pool)`
+  into `boarding.NewHandlers`.
+- Tests: `backend/internal/boarding/code_test.go` (alphabet/length/exclusion,
+  uniqueness, normalization), `ratelimit_test.go` (per-driver independence,
+  window expiry), and new cases in `boarding_test.go` —
+  `TestShortCode_RoundTrip_FreshChargeSeatDecrement`,
+  `TestShortCode_CaseAndHyphenTolerant`,
+  `TestShortCode_Idempotent_SameCodeTwice`, `TestUnknownCode_Rejected`,
+  `TestShortCode_RateLimited`, and the expired-code assertion added to
+  `TestExpiredPass_Rejected`. Every pre-existing Stage 5 test passes
+  unchanged (the token path was not modified). Also fixed a latent
+  test-data-collision bug in `boarding_test.go`'s `uniqueSuffix` while
+  working here — it only combined a per-call `time.Now().UnixNano()`
+  (no atomic counter), the exact pre-fix pattern Stage 3's test-hygiene
+  entry already flagged and fixed in `wallet`/`identity`; adding several
+  more `seedFixture` calls per test surfaced a real "already exists" 409
+  collision on this Windows dev machine's clock resolution. Fixed the same
+  way as Stage 3: an atomic counter alongside the timestamp.
+- `apps/commuter/src/types.ts`, `src/screens/BoardScreen.tsx` — `short_code`
+  wired through; hero code display + demoted token disclosure.
+- `apps/driver/src/api/client.ts`, `src/screens/ScanScreen.tsx` —
+  `scanBoardingCode`; the code-entry field as the primary manual-mode
+  control, demoted token-paste fallback, shape-based camera dispatch.
+
+Verified: `go build ./...`, `go vet ./...`, `gofmt -l .`, `go mod tidy`
+(no `go.mod`/`go.sum` changes) all clean. `go test -race -count=1 ./...`
+green across every backend package, run three times in a row against the
+same live Postgres to confirm the `uniqueSuffix` fix actually resolved the
+collision (it reproduced once before the fix, not at all after). `npx tsc
+--noEmit` and `npm run build` clean in `apps/commuter` and `apps/driver`
+(and re-confirmed `apps/owner` untouched by this stage still builds clean).
+Playwright (cached Chromium, same approach as Stages 9a/9b-ii): screenshotted
+the commuter Board screen — the boarding code (`0XA4-Y6H0`) rendered as the
+large hero above a visibly chunky, low-density QR, with the live countdown
+still ticking — and the driver Scan screen's new code-entry field (shown
+both empty, with the `K7M2-9XQP`-style placeholder, and mid-flow). Then
+closed the loop for real over the live API (not just the integration
+tests): brought driver 1 online on "Cape Town CBD - Bellville" via
+`cmd/wsdriver`, issued a real pass over `POST /boarding/pass` (fare 1100),
+scanned it by **short code** — fresh charge, `replayed:false`, split
+110/275/715, seats 16→15, wallet 8700→7600 — then re-scanned the **same
+code with mixed case and a hyphen inserted** (`48ap-5x63` for stored
+`48AP5X63`) and confirmed the identical `transaction_id` came back with
+`replayed:true` and the wallet balance unchanged at 7600 — proving the
+case/hyphen-tolerant normalization and the idempotency guarantee together,
+against the real running stack. Ran `cmd/cleanup -apply` against the dev DB
+as part of this verification (which is what surfaced and got the FK-ordering
+fix above), then re-ran the full race suite afterward to confirm the fix
+didn't regress anything.
+
+Next: Stage 9d — cross-cutting polish, or further frontend work, as directed.

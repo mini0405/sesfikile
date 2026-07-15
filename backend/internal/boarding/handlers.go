@@ -28,18 +28,27 @@ type Handlers struct {
 	signer       Signer
 	ttl          time.Duration
 	split        config.FareSplit
+	passStore    *PassStore
+	// codeRateLimiter throttles short-code scan attempts per driver — see
+	// ratelimit.go. Constructed internally (10 attempts / minute / driver)
+	// rather than taking a parameter: it has no meaningful per-deployment
+	// config yet and keeping NewHandlers's signature focused on real
+	// dependencies matters more than exposing a knob nothing tunes.
+	codeRateLimiter *codeRateLimiter
 }
 
-func NewHandlers(routingRepo *routing.Repo, walletRepo *wallet.Repo, identityRepo *identity.Repo, store *telemetry.VehicleStateStore, hub *telemetry.Hub, signer Signer, ttl time.Duration, split config.FareSplit) *Handlers {
+func NewHandlers(routingRepo *routing.Repo, walletRepo *wallet.Repo, identityRepo *identity.Repo, store *telemetry.VehicleStateStore, hub *telemetry.Hub, signer Signer, ttl time.Duration, split config.FareSplit, passStore *PassStore) *Handlers {
 	return &Handlers{
-		routingRepo:  routingRepo,
-		walletRepo:   walletRepo,
-		identityRepo: identityRepo,
-		telemetry:    store,
-		hub:          hub,
-		signer:       signer,
-		ttl:          ttl,
-		split:        split,
+		routingRepo:     routingRepo,
+		walletRepo:      walletRepo,
+		identityRepo:    identityRepo,
+		telemetry:       store,
+		hub:             hub,
+		signer:          signer,
+		ttl:             ttl,
+		split:           split,
+		passStore:       passStore,
+		codeRateLimiter: newCodeRateLimiter(time.Minute, 10),
 	}
 }
 
@@ -61,9 +70,16 @@ type issuePassRequest struct {
 
 type issuePassResponse struct {
 	PassToken string `json:"pass_token"`
+	ShortCode string `json:"short_code"`
 	ExpiresAt string `json:"expires_at"`
 	FareCents int64  `json:"fare_cents"`
 }
+
+// maxCodeGenerationAttempts bounds the retry loop for a short-code collision
+// (23505 unique violation on boarding_pass_codes.code) — astronomically
+// unlikely at 32^8 ≈ 1.1e12 combinations, but IssuePass doesn't assume it can
+// never happen.
+const maxCodeGenerationAttempts = 5
 
 // IssuePass handles POST /boarding/pass (commuter only). It prices the
 // from->to ride on route_id using Stage 3 routing (rejecting if there's no
@@ -146,8 +162,44 @@ func (h *Handlers) IssuePass(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Issue a short code as a HANDLE to the signed token above — the token
+	// itself remains the canonical, verified artifact (see passstore.go). A
+	// short code makes the QR chunky/instantly-scannable and gives commuters
+	// a typeable/speakable fallback when the driver's camera is unavailable
+	// (e.g. no secure-context camera permission over plain http on a LAN).
+	var shortCode string
+	for attempt := 0; attempt < maxCodeGenerationAttempts; attempt++ {
+		candidate, err := GenerateCode()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to generate boarding code")
+			return
+		}
+		err = h.passStore.Store(r.Context(), IssuedPass{
+			Code:       candidate,
+			PassToken:  token,
+			Nonce:      payload.Nonce,
+			CommuterID: payload.CommuterID,
+			RouteID:    payload.RouteID,
+			ExpiresAt:  payload.ExpiresAt,
+		})
+		if err == nil {
+			shortCode = candidate
+			break
+		}
+		if !IsUniqueViolation(err) {
+			writeError(w, http.StatusInternalServerError, "failed to issue boarding code")
+			return
+		}
+		// Collision — retry with a freshly generated code.
+	}
+	if shortCode == "" {
+		writeError(w, http.StatusInternalServerError, "failed to issue boarding code")
+		return
+	}
+
 	writeJSON(w, http.StatusCreated, issuePassResponse{
 		PassToken: token,
+		ShortCode: shortCode,
 		ExpiresAt: payload.ExpiresAt.UTC().Format(time.RFC3339),
 		FareCents: fareCents,
 	})
@@ -155,6 +207,11 @@ func (h *Handlers) IssuePass(w http.ResponseWriter, r *http.Request) {
 
 type scanPassRequest struct {
 	PassToken string `json:"pass_token"`
+	// ShortCode is the airline-PNR-style alternative to PassToken — resolved
+	// to the same stored, signed token and then run through the EXACT SAME
+	// verification path below (see ScanPass). Exactly one of PassToken /
+	// ShortCode is expected; PassToken wins if both are somehow present.
+	ShortCode string `json:"short_code"`
 }
 
 type scanPassResponse struct {
@@ -168,7 +225,15 @@ type scanPassResponse struct {
 }
 
 // ScanPass handles POST /boarding/scan (driver only) — the hero moment.
-// Verification order, each failing distinctly:
+// Accepts EITHER pass_token (Stage 5, unchanged) OR short_code (a stored
+// handle resolved to the same signed token via h.passStore — see
+// passstore.go). Whichever way the token is obtained, it is run through the
+// exact same verification sequence below — the short-code path is never a
+// separate/weaker check:
+//  0. (short_code only) Rate limit, then resolve the code to its stored
+//     token. An unknown/expired-and-swept code fails exactly like a tampered
+//     token (401) — see passstore.go's PassStore.Lookup doc comment for why
+//     that's deliberate (no oracle for which codes were ever real).
 //  1. HMAC signature (constant-time compare) — tampered pass rejected.
 //  2. Expiry — expired pass rejected.
 //  3. Driver is online (Stage 4) and assigned (Stage 1) to a vehicle on the
@@ -189,13 +254,31 @@ func (h *Handlers) ScanPass(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.PassToken == "" {
-		writeError(w, http.StatusBadRequest, "pass_token is required")
+	if req.PassToken == "" && req.ShortCode == "" {
+		writeError(w, http.StatusBadRequest, "pass_token or short_code is required")
 		return
 	}
 
+	passToken := req.PassToken
+	if passToken == "" {
+		// 0. Rate limit code-based scan attempts per driver, then resolve.
+		if !h.codeRateLimiter.Allow(claims.UserID) {
+			writeError(w, http.StatusTooManyRequests, "too many boarding code attempts — try again shortly")
+			return
+		}
+		issued, err := h.passStore.Lookup(r.Context(), req.ShortCode)
+		if err != nil {
+			// Deliberately the SAME status/message as a tampered token (see
+			// PassStore.Lookup's doc comment) — an unknown code must not be
+			// distinguishable from a forged one.
+			writeError(w, http.StatusUnauthorized, "invalid or tampered pass")
+			return
+		}
+		passToken = issued.PassToken
+	}
+
 	// 1. Signature.
-	payload, err := h.signer.Verify(req.PassToken)
+	payload, err := h.signer.Verify(passToken)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "invalid or tampered pass")
 		return

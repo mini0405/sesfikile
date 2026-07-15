@@ -115,26 +115,36 @@ Note it exactly — you'll check it again after boarding.
    pair along that route.
 3. Click **"Generate boarding pass"**.
 
-**Expect:** a ticket appears with a QR code, a stamp reading "Valid", and a
-live countdown (the pass expires ~3 minutes after issue — if it turns
-"Expired" before you scan it, just generate a new one).
+**Expect:** a ticket appears with a large **boarding code** as the hero
+(grouped like `K7M2-9XQP`), a chunky/low-density QR beneath it (it now
+encodes only that 8-character code, not the full signed token — noticeably
+smaller/blockier than before this stage), a stamp reading "Valid", and a live
+countdown (the pass expires ~3 minutes after issue — if it turns "Expired"
+before you scan it, just generate a new one).
 
-4. Since a laptop has no camera pointed at its own screen, click **"No
-   camera? Show raw token"** to expand it, then **"Copy token"** (it will
-   read "Copied!" briefly). This is the **manual token paste fallback** the
-   driver app needs.
+4. Note the boarding code (or click **"Copy code"** — it will read "Copied!"
+   briefly). This is the **short-code fallback** the driver app needs when
+   there's no camera pointed at the commuter's screen — the normal case on a
+   single laptop, and the *only* option on a real phone-to-phone LAN demo
+   (see Known Limitations below).
 
-### Step 5 — Driver scans the pass (manual paste)
+### Step 5 — Driver scans the pass (boarding code)
 
 1. Switch to the driver app window. Go to the **Scan** screen.
-2. Click **"Paste pass token instead"** (skip the camera option — no camera
-   is pointed at the commuter's screen).
-3. Paste the token into the text box and click **"Charge fare"**.
+2. Click **"Enter boarding code instead"** (skip the camera option — no
+   camera is pointed at the commuter's screen).
+3. Type the boarding code into the field (case doesn't matter, and the hyphen
+   is optional) and click **"Charge fare"**.
 
 **Expect:** a "ticket" result screen appears with a stamp reading **"Paid"**,
 heading "Fare charged", the fare amount, and a breakdown of **Driver share /
 Owner share / Platform fee / Seats remaining**. Note the fare and the new
 seats-remaining number.
+
+*(Dev-only alternative: the driver Scan screen's "Dev fallback: paste full
+pass token" disclosure still accepts the raw `pass_token` directly, exactly
+as before this stage — useful for testing the token path in isolation, not
+part of the normal demo flow.)*
 
 ### Step 6 — Confirm the commuter's wallet dropped by exactly the fare
 
@@ -160,8 +170,9 @@ approximately — exactly, to the cent.
 This proves a replayed scan can't charge someone twice.
 
 1. Back in the driver app's Scan screen, after Step 5 above, click **"Scan
-   next pass"**, then paste the **exact same token** again and click
-   **"Charge fare"**.
+   next pass"**, then enter the **exact same boarding code** again (try
+   mixing the case or dropping the hyphen — it still resolves to the same
+   pass) and click **"Charge fare"**.
 
 **Expect:** the result screen's stamp now reads **"Already Paid"** with a
 note that the commuter was *not* charged again. "Seats remaining" is
@@ -221,13 +232,18 @@ on one, so a pass could never be scanned).
 
 ## 8. KNOWN LIMITATIONS (read before reporting something as broken)
 
-- **Camera QR scanning and GPS geolocation require a secure context**
+- **Camera QR scanning and GPS geolocation still require a secure context**
   (`localhost` or `https`). Both work fine over `http://localhost:...` on the
   same machine (what this checklist uses), but **will not work** if you open
   the app from a phone over your LAN at `http://<your-pc-ip>:5175` — the
-  browser will silently refuse camera/location access. The **manual token
-  paste** fallback (Step 5 above) is the intended dev-path workaround for
-  this, not a hack.
+  browser will silently refuse camera/location access. **This no longer
+  blocks the core boarding demo**, though: the boarding **code** (Step 4/5
+  above) is a typeable/speakable fallback specifically designed for this case
+  — read the code off the commuter's phone screen and type it into the
+  driver's Scan screen, no camera permission needed on either device. (GPS
+  geolocation for the driver's live position is a separate permission and
+  still needs a secure context or a manually-entered position if testing
+  that specific feature over LAN.)
 - **Catalogue routes are browse-only.** They will never show a live vehicle,
   never offer a boarding pass, and their fares are distance-estimated, not
   real association tariffs.

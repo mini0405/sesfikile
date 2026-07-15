@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,6 +38,7 @@ type testEnv struct {
 	tokens    identity.TokenIssuer
 	server    *httptest.Server
 	fareSplit config.FareSplit
+	passStore *boarding.PassStore
 }
 
 func setup(t *testing.T) *testEnv {
@@ -72,7 +74,8 @@ func setup(t *testing.T) *testEnv {
 	fareSplit := config.FareSplit{PlatformPct: 10, DriverPct: 25, OwnerPct: 65}
 
 	signer := boarding.NewSigner("boarding-integration-test-hmac-secret")
-	handlers := boarding.NewHandlers(routingRepo, walletRepo, identityRepo, store, hub, signer, 3*time.Minute, fareSplit)
+	passStore := boarding.NewPassStore(pool)
+	handlers := boarding.NewHandlers(routingRepo, walletRepo, identityRepo, store, hub, signer, 3*time.Minute, fareSplit, passStore)
 
 	r := chi.NewRouter()
 	r.Post("/boarding/pass", withClaims(tokens, handlers.IssuePass))
@@ -91,6 +94,7 @@ func setup(t *testing.T) *testEnv {
 		tokens:    tokens,
 		server:    server,
 		fareSplit: fareSplit,
+		passStore: passStore,
 	}
 }
 
@@ -104,8 +108,18 @@ func withClaims(tokens identity.TokenIssuer, next http.HandlerFunc) http.Handler
 	return handler.ServeHTTP
 }
 
+// uniqueCounter combines with a per-call nanosecond timestamp so uniqueSuffix
+// never repeats even across two calls landing in the same nanosecond tick —
+// same fix as wallet.uniquePhone/identity's phone generator (see
+// docs/PROGRESS.md's Stage 3 test-hygiene entry): this is a shared,
+// persistent dev database, not reset between runs, so collisions are
+// possible both across runs (guarded by the timestamp) and within a single
+// run's fast-running tests (guarded by the atomic counter).
+var uniqueCounter int64
+
 func uniqueSuffix() string {
-	return fmt.Sprintf("%d", time.Now().UnixNano())
+	n := atomic.AddInt64(&uniqueCounter, 1)
+	return fmt.Sprintf("%d%d", time.Now().UnixNano(), n)
 }
 
 func parseUUID(s string) (uuid.UUID, error) {
@@ -247,6 +261,16 @@ func doJSON(t *testing.T, server *httptest.Server, method, path, token string, b
 
 func issuePass(t *testing.T, env *testEnv, fx fixture) (token string, fareCents int64) {
 	t.Helper()
+	tok, _, fare := issuePassFull(t, env, fx)
+	return tok, fare
+}
+
+// issuePassFull returns the pass_token, short_code, and fare_cents from a
+// real POST /boarding/pass call — the one place both artifacts of a single
+// issued pass are captured together for tests that need to exercise the
+// short-code path.
+func issuePassFull(t *testing.T, env *testEnv, fx fixture) (token, shortCode string, fareCents int64) {
+	t.Helper()
 	status, body := doJSON(t, env.server, http.MethodPost, "/boarding/pass", fx.CommuterTok, map[string]string{
 		"route_id":     fx.RouteID,
 		"from_stop_id": fx.FromStopID,
@@ -259,13 +283,24 @@ func issuePass(t *testing.T, env *testEnv, fx fixture) (token string, fareCents 
 	if tok == "" {
 		t.Fatalf("expected pass_token in response, got %+v", body)
 	}
-	return tok, int64(body["fare_cents"].(float64))
+	code, _ := body["short_code"].(string)
+	if code == "" {
+		t.Fatalf("expected short_code in response, got %+v", body)
+	}
+	return tok, code, int64(body["fare_cents"].(float64))
 }
 
 func scanPass(t *testing.T, env *testEnv, driverTok, passToken string) (int, map[string]any) {
 	t.Helper()
 	return doJSON(t, env.server, http.MethodPost, "/boarding/scan", driverTok, map[string]string{
 		"pass_token": passToken,
+	})
+}
+
+func scanPassByCode(t *testing.T, env *testEnv, driverTok, shortCode string) (int, map[string]any) {
+	t.Helper()
+	return doJSON(t, env.server, http.MethodPost, "/boarding/scan", driverTok, map[string]string{
+		"short_code": shortCode,
 	})
 }
 
@@ -437,7 +472,7 @@ func TestExpiredPass_Rejected(t *testing.T) {
 	// Issue a pass through a handler wired with a near-zero TTL so it's
 	// already expired by the time we scan it, without sleeping in the test.
 	shortSigner := boarding.NewSigner("boarding-integration-test-hmac-secret")
-	shortHandlers := boarding.NewHandlers(env.routing, env.wallet, env.identity, env.telemetry, env.hub, shortSigner, 1*time.Nanosecond, env.fareSplit)
+	shortHandlers := boarding.NewHandlers(env.routing, env.wallet, env.identity, env.telemetry, env.hub, shortSigner, 1*time.Nanosecond, env.fareSplit, env.passStore)
 	shortRouter := chi.NewRouter()
 	shortRouter.Post("/boarding/pass", withClaims(env.tokens, shortHandlers.IssuePass))
 	shortServer := httptest.NewServer(shortRouter)
@@ -452,6 +487,7 @@ func TestExpiredPass_Rejected(t *testing.T) {
 		t.Fatalf("expected 201 issuing short-TTL pass, got %d: %+v", status, body)
 	}
 	passToken := body["pass_token"].(string)
+	shortCode := body["short_code"].(string)
 
 	time.Sleep(10 * time.Millisecond) // guarantee we're past the 1ns TTL
 
@@ -469,6 +505,15 @@ func TestExpiredPass_Rejected(t *testing.T) {
 	gotSeats, _ := env.vehicleSeats(fx.VehicleID)
 	if gotSeats != seatsBefore {
 		t.Fatalf("expected no seat change, got %d want %d", gotSeats, seatsBefore)
+	}
+
+	// The short-code path must fail identically (410) — the code inherits
+	// the pass's own TTL, and the row is still present (well within
+	// sweepGrace), so this proves the code path re-runs the exact same
+	// expiry check rather than a separate/looser one.
+	codeScanStatus, codeScanBody := scanPassByCode(t, env, fx.DriverTok, shortCode)
+	if codeScanStatus != http.StatusGone {
+		t.Fatalf("expected 410 for expired short code, got %d: %+v", codeScanStatus, codeScanBody)
 	}
 }
 
@@ -578,5 +623,163 @@ func TestDriverOffline_Rejected(t *testing.T) {
 	gotBalance := env.commuterBalance(t, fx.CommuterID)
 	if gotBalance != 10000 {
 		t.Fatalf("expected no charge, balance still 10000, got %d", gotBalance)
+	}
+}
+
+// ---- Short boarding codes (airline-style handle to the existing signed
+// token) — the token path above is entirely unchanged; these tests exercise
+// the new short_code alternative, which resolves to the same stored token
+// and then runs through the EXACT SAME verification sequence (see
+// Handlers.ScanPass).
+
+func TestShortCode_RoundTrip_FreshChargeSeatDecrement(t *testing.T) {
+	env := setup(t)
+	fx := seedFixture(t, env, 10000, 1500)
+
+	_, shortCode, fareCents := issuePassFull(t, env, fx)
+	if fareCents != 1500 {
+		t.Fatalf("expected fare_cents 1500, got %d", fareCents)
+	}
+
+	seatsBefore, ok := env.vehicleSeats(fx.VehicleID)
+	if !ok {
+		t.Fatalf("expected vehicle to be tracked")
+	}
+
+	status, body := scanPassByCode(t, env, fx.DriverTok, shortCode)
+	if status != http.StatusCreated {
+		t.Fatalf("expected 201 on fresh code scan, got %d: %+v", status, body)
+	}
+	if body["replayed"] != false {
+		t.Fatalf("expected replayed=false on fresh code scan, got %+v", body)
+	}
+	if int64(body["fare_cents"].(float64)) != 1500 {
+		t.Fatalf("expected fare_cents 1500, got %+v", body)
+	}
+	platform := int64(body["platform_cents"].(float64))
+	driverCents := int64(body["driver_cents"].(float64))
+	owner := int64(body["owner_cents"].(float64))
+	if platform+driverCents+owner != 1500 {
+		t.Fatalf("split %d+%d+%d does not sum to fare 1500", platform, driverCents, owner)
+	}
+	seatsRemaining := int(body["seats_remaining"].(float64))
+	if seatsRemaining != seatsBefore-1 {
+		t.Fatalf("expected seats_remaining %d, got %d", seatsBefore-1, seatsRemaining)
+	}
+
+	gotBalance := env.commuterBalance(t, fx.CommuterID)
+	if gotBalance != 10000-1500 {
+		t.Fatalf("expected commuter balance %d, got %d", 10000-1500, gotBalance)
+	}
+}
+
+// TestShortCode_CaseAndHyphenTolerant proves the code lookup normalizes
+// case, hyphens, and surrounding whitespace, matching a commuter reading a
+// grouped display code (e.g. "K7M2-9XQP") aloud or a driver typing it as
+// shown, in any case.
+func TestShortCode_CaseAndHyphenTolerant(t *testing.T) {
+	env := setup(t)
+	fx := seedFixture(t, env, 10000, 1500)
+
+	_, shortCode, _ := issuePassFull(t, env, fx)
+
+	messy := " " + shortCode[:4] + "-" + shortCode[4:] + " "
+	messy = toLowerASCII(messy)
+
+	status, body := scanPassByCode(t, env, fx.DriverTok, messy)
+	if status != http.StatusCreated {
+		t.Fatalf("expected 201 scanning a messily-formatted code, got %d: %+v", status, body)
+	}
+}
+
+func toLowerASCII(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
+}
+
+// TestShortCode_Idempotent_SameCodeTwice mirrors TestDoubleScan_IdempotentReplay
+// but scans by code both times — same nonce underneath, so the second scan
+// must report the same transaction, not double-charge, and not double-
+// decrement seats, identical to the token path's guarantee.
+func TestShortCode_Idempotent_SameCodeTwice(t *testing.T) {
+	env := setup(t)
+	fx := seedFixture(t, env, 10000, 1500)
+	_, shortCode, _ := issuePassFull(t, env, fx)
+
+	status1, body1 := scanPassByCode(t, env, fx.DriverTok, shortCode)
+	if status1 != http.StatusCreated || body1["replayed"] != false {
+		t.Fatalf("expected fresh charge on first code scan, got %d: %+v", status1, body1)
+	}
+	txn1 := body1["transaction_id"]
+	seatsAfterFirst, _ := env.vehicleSeats(fx.VehicleID)
+
+	status2, body2 := scanPassByCode(t, env, fx.DriverTok, shortCode)
+	if status2 != http.StatusOK {
+		t.Fatalf("expected 200 on replayed code scan, got %d: %+v", status2, body2)
+	}
+	if body2["replayed"] != true {
+		t.Fatalf("expected replayed=true on second code scan, got %+v", body2)
+	}
+	if body2["transaction_id"] != txn1 {
+		t.Fatalf("expected same transaction id, got %v and %v", txn1, body2["transaction_id"])
+	}
+
+	gotBalance := env.commuterBalance(t, fx.CommuterID)
+	if gotBalance != 10000-1500 {
+		t.Fatalf("expected wallet debited exactly once (%d), got %d", 10000-1500, gotBalance)
+	}
+	gotSeats, _ := env.vehicleSeats(fx.VehicleID)
+	if gotSeats != seatsAfterFirst {
+		t.Fatalf("expected seats unchanged by replay (%d), got %d", seatsAfterFirst, gotSeats)
+	}
+}
+
+// TestUnknownCode_Rejected proves a never-issued code fails cleanly and — per
+// the design brief — identically to a tampered token: same 401 status and
+// message, so an attacker probing codes can't distinguish "wrong" from
+// "doesn't exist."
+func TestUnknownCode_Rejected(t *testing.T) {
+	env := setup(t)
+	fx := seedFixture(t, env, 10000, 1500)
+
+	status, body := scanPassByCode(t, env, fx.DriverTok, "ZZZZZZZZ")
+	if status != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unknown code, got %d: %+v", status, body)
+	}
+
+	gotBalance := env.commuterBalance(t, fx.CommuterID)
+	if gotBalance != 10000 {
+		t.Fatalf("expected no charge, balance still 10000, got %d", gotBalance)
+	}
+}
+
+// TestCatalogueRoute_PassRejected already proves IssuePass rejects a
+// catalogue route before any token/code exists at all — there is no separate
+// code-issuing path to bypass that guard through, since IssuePass is the
+// single place both artifacts are minted together.
+
+func TestShortCode_RateLimited(t *testing.T) {
+	env := setup(t)
+	fx := seedFixture(t, env, 10000, 1500)
+
+	// The rate limiter (10 attempts/minute/driver, see ratelimit.go) is keyed
+	// by driver id, so repeated invalid-code attempts from the same driver
+	// account eventually get throttled with 429, distinct from the 401 an
+	// individual unknown code gets while still under the limit.
+	var lastStatus int
+	var lastBody map[string]any
+	for i := 0; i < 15; i++ {
+		lastStatus, lastBody = scanPassByCode(t, env, fx.DriverTok, "NOTREALL")
+		if lastStatus == http.StatusTooManyRequests {
+			break
+		}
+	}
+	if lastStatus != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 after repeated invalid code attempts, got %d: %+v", lastStatus, lastBody)
 	}
 }
